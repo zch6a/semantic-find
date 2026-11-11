@@ -1,6 +1,6 @@
-"""Which files to search. In a git repository, what git tracks or would track (so .gitignore is
-honoured exactly as git reads it); elsewhere, every file except well-known clutter: version-control
-folders, dependency and build folders, caches, and hidden folders."""
+"""Which files to search. In a git repository, every file git tracks, and the untracked ones git does
+not ignore (so .gitignore is honoured exactly as git reads it), except untracked dependency and build
+folders; elsewhere, every file except that clutter, version-control folders and hidden folders."""
 
 from __future__ import annotations
 
@@ -18,7 +18,8 @@ MAX_FILE = 50 * 1024 * 1024  # documents larger than this are skipped
 IGNORE_FILE = ".sfindignore"  # extra patterns, one per line, as in .gitignore (a simplified reading)
 
 
-def _git_files(root: Path) -> list[Path] | None:
+def _git_files(root: Path) -> tuple[list[str], list[str]] | None:
+    """(tracked, untracked and not ignored) paths relative to `root`, or None outside a repository."""
     git = shutil.which("git")
     if not git:
         return None
@@ -26,14 +27,16 @@ def _git_files(root: Path) -> list[Path] | None:
         inside = subprocess.run([git, "-C", str(root), "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True, timeout=10)
         if inside.returncode != 0 or inside.stdout.strip() != "true":
             return None
-        out = subprocess.run([git, "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-                             capture_output=True, timeout=120)
+        lists = []
+        for args in (["--cached"], ["--others", "--exclude-standard"]):
+            out = subprocess.run([git, "-C", str(root), "ls-files", "-z", *args], capture_output=True, timeout=120)
+            if out.returncode != 0:
+                return None
+            names = out.stdout.decode("utf-8", "surrogateescape").split("\0")
+            lists.append([n for n in dict.fromkeys(names) if n])  # a file in a merge conflict is listed once per side
     except (OSError, subprocess.SubprocessError):
         return None
-    if out.returncode != 0:
-        return None
-    names = out.stdout.decode("utf-8", "surrogateescape").split("\0")
-    return [root / n for n in names if n]
+    return lists[0], lists[1]
 
 
 def _patterns(root: Path) -> list[str]:
@@ -65,10 +68,13 @@ def discover(root: Path) -> Iterator[Path]:
     patterns = _patterns(root)
     listed = _git_files(root)
     if listed is not None:
-        for p in listed:
-            rel = p.relative_to(root).as_posix()
+        tracked, untracked = listed
+        for rel in tracked:  # what git tracks is searched, in build/ or dist/ too
+            if not _ignored(rel, patterns):
+                yield root / rel
+        for rel in untracked:  # an untracked node_modules or .venv is clutter, ignored or not
             if not _ignored(rel, patterns) and not any(part in SKIP_DIRS for part in rel.split("/")[:-1]):
-                yield p
+                yield root / rel
         return
     for dirpath, dirnames, filenames in os.walk(root):
         base = Path(dirpath)

@@ -90,3 +90,15 @@ def test_matched_character_pairs_are_shown_as_words():
     assert join_pairs("数据库连接池怎么配置", ["连接", "接池", "配置"]) == ["连接池", "配置"]
     assert join_pairs("renew passport", ["passport"]) == ["passport"]
     assert join_pairs("护照和签证", ["护照", "签证", "visa"]) == ["护照", "签证", "visa"]
+
+
+def test_pdf_pages_are_read_and_counted(tmp_path):
+    import pytest
+
+    pytest.importorskip("pypdf")
+    from pdfmaker import make_pdf
+
+    text = read_text(tmp_path / "guide.pdf", make_pdf(["Renew the passport early", "Visa rules for Japan"]))
+    assert "Renew the passport early" in text and "\f" in text
+    assert [(p.page, p.text) for p in passages(text)] == [(1, "Renew the passport early"), (2, "Visa rules for Japan")]
+    assert read_text(tmp_path / "broken.pdf", b"%PDF-1.4 not really") is None, "a broken PDF is skipped, not an error"

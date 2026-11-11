@@ -37,3 +37,59 @@
 - PDF extraction is untested (it needs a PDF fixture with text).
 
 34 tests (tiny hand-made model; no download, no network), ruff clean.
+## Round 1
+
+Three things this round: an independent review of the code (with every finding reproduced), the open items from development, and a measurement of search quality.
+
+**Search quality, measured.** `eval/` is a new evaluation set: 29 synthetic notes, documents and code files in English and Chinese (with near-misses, such as two notes about passports), and 45 queries with known answers, of three kinds (same words, other words, other language). `eval/evaluate.py` reports hit@1, hit@5 and MRR per mode.
+- **Reciprocal-rank fusion, the usual way to merge rankings, was the weak point.** With the default model it found the right file first for only 22% of cross-language queries, against 67% for search by meaning alone. With k = 60, rank 4 counts almost as much as rank 1, so a passage sharing one word of four with the query ("settings" in "database connection pool settings") outranked the Chinese note that meant what was asked. Damping keyword hits by coverage did not help, because the problem is the ranks themselves.
+- **It was replaced by score fusion**: similarity relative to the best, plus 0.5 × the share of the query's words the passage contains, IDF-weighted, over terms that occur in the index. The weight 0.5 was chosen from 0.2–1.5 on three models. With the default model:
+
+  | | top 1 | top 1, same language, other words | top 1, other language |
+  |---|---|---|---|
+  | rank fusion | 80% | 93% | 22% |
+  | score fusion | 84% | 93% | 44% |
+
+  English-only models are within one query either way. Searching by meaning alone is still better across languages (67%), and the README says so.
+
+**The review: 9 confirmed findings and 5 suspected. All are fixed, each with a test in `tests/test_review.py`.**
+- **One damaged file stopped the folder for good.** An empty, truncated or password-protected PDF, or a notebook with `"cells": null`, raised out of `update`. The update was one transaction, so nothing was saved and every later run failed on the same file. It also exited with 1, which means "nothing found". Now a file that cannot be read is skipped, progress is committed every 200 files (an interrupted first index keeps what it has done), and any unexpected error exits 2 with a one-line message.
+- **Two sfinds at once**: the second died with "database is locked". An OS file lock now lets one update at a time; the other searches the index as it is and says so.
+- **A git merge conflict** lists a file once per side, which broke a UNIQUE constraint. Duplicates are dropped.
+- **Zip bombs**: a 299 KB .docx unpacked to 300 MB and peaked at 1.1 GB of memory. Unpacking is now capped at 200 MB per document, checked against each part's declared size before reading, and at 5,000 parts.
+- **`-g` missed matches** beyond the first 300 candidates. The pattern now filters before ranking, in SQL for keywords and as a mask for vectors.
+- **A download whose `.part` was already whole** (interrupted during the hash check) asked for a range past the end and got 416, forever. Now:
+  - a whole part is only checked;
+  - one that is too long is discarded;
+  - a 416 deletes the part.
+- **Piped `-l` and `--json` on Windows** turned "café 여권 ✓" into "?". Output into a pipe is now UTF-8.
+- **Legacy encodings**: cp1252, Shift-JIS and EUC-KR files were read as GB18030 mojibake or dropped. charset-normalizer was tried and got short GB18030 Chinese wrong (as Korean) and every cp1252 sample. Instead, each candidate decoding is scored by its share of everyday characters in its own script: GB2312 level-1 hanzi, Big5 frequent hanzi, kana and JIS level-1 kanji, Hangul, Latin letters. EUC-KR and GB18030 read the same bytes as equally common characters, so Korean's spaces between words break the tie. 14 of 15 samples come out right; the miss is a string of rare characters only.
+- **Smaller findings:**
+  - a query word that named a folder ("how tests work") became a path; paths are now only the trailing arguments;
+  - tracked files under `build/` and `dist/` were skipped in git repositories (git's view now wins for tracked files, and untracked dependency folders are still skipped);
+  - `--no-update` with another model gave a numpy error, and is now explained;
+  - index names ignored case on Linux;
+  - `OLLAMA_HOST=0.0.0.0` was refused;
+  - a one-character Chinese query never matched (single CJK characters are now indexed too).
+- **Suspected, also fixed:**
+  - the download trusted the mirror for both the file and its hash. Every file of the built-in models is now pinned by revision, size and SHA-256, and the Hugging Face API is no longer called at all. During this round it answered "maximum queue size reached", so that also makes downloads more reliable;
+  - on Linux and macOS, indexes are readable by their owner only (0600 files, 0700 folder);
+  - Office text kept tabs and line breaks, and text boxes no longer repeat their paragraphs;
+  - typed-in Excel cells are read;
+  - crafted safetensors headers (offsets outside the file) are refused.
+- Checked by the reviewer and found fine:
+  - FTS5 query syntax in queries;
+  - queries of only punctuation or stop words;
+  - files deleted while indexing;
+  - non-ASCII names in git mode;
+  - Ollama requests bypassing proxies.
+
+**Open items from development**
+- **The stalled download was a measurement error.** On Windows, a directory listing shows a stale size for a file that is still open, and opening a handle showed it growing: 82, 92, 102 MB. The real flaw was silence: without a terminal there was no progress at all. Now a line is printed at each tenth.
+- **Indexing speed**: profiling showed that splitting words into terms took 5.3 s of 9.8 s, because the regexes ran on every token. Terms are now cached per distinct word. The standard library (728 files, 12,254 passages) indexes in 5.0 s, against 6.2 s before with a warm disk cache; the 17 s measured earlier had a cold one.
+- **Search start-up**: the multilingual model took 1.64 s to load, and 0.7 s of that was spent working out the unknown-token id and median token length on every run. Both are now cached next to the model, so it loads in 0.94 s. Most of what is left is the tokenizer parsing its 18 MB JSON. A search takes about 1.9 s in all with the default model and 0.7 s with an English one, and the README says so. `urllib.request` is now imported only to download or to reach Ollama.
+- **PDF**: tested with a PDF written by hand (`tests/pdfmaker.py`). The test found that a broken PDF raised pypdf's own error type, which was the review's first finding seen from another side.
+
+**Docs**: the README has a measured-results table in both languages, the scoring described as it is, git and concurrency behaviour, the pinned downloads, and timings that are now measured. New CONTRIBUTING.md and CHANGELOG.md.
+
+60 tests, ruff clean (CI now lints `eval/` too).

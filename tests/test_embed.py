@@ -96,20 +96,22 @@ class Server:
         self.server.shutdown()
 
 
-def _listing(files, lie_about=None):
-    out = []
-    for name, data in files.items():
-        entry = {"type": "file", "path": name, "size": len(data)}
-        if name.endswith(".safetensors"):
-            entry["lfs"] = {"oid": "0" * 64 if name == lie_about else hashlib.sha256(data).hexdigest()}
-        out.append(entry)
-    return out
+def pin(monkeypatch, files, lie_about=None):
+    """Replace the built-in potion-base-8M by the fake model's files, pinned by size and SHA-256."""
+    import dataclasses
+
+    from semantic_find import embed
+
+    pinned = {f: (len(d), "0" * 64 if f == lie_about else hashlib.sha256(d).hexdigest()) for f, d in files.items()}
+    fake = dataclasses.replace(embed.MODELS["potion-base-8M"], files=pinned, revision="abc123")
+    monkeypatch.setitem(embed.MODELS, "potion-base-8M", fake)
 
 
 def test_a_model_is_downloaded_checked_and_resumed(tmp_path, monkeypatch, home):
     src = make_model(tmp_path / "src")
     files = {f: (src / f).read_bytes() for f in ("config.json", "tokenizer.json", "model.safetensors")}
-    hf = Server(files, _listing(files))
+    hf = Server(files)
+    pin(monkeypatch, files)
     monkeypatch.setenv("HF_ENDPOINT", hf.url)
     try:
         part = home / "models" / "potion-base-8M" / "model.safetensors.part"
@@ -117,7 +119,8 @@ def test_a_model_is_downloaded_checked_and_resumed(tmp_path, monkeypatch, home):
         part.write_bytes(files["model.safetensors"][:100])  # an interrupted download
         download("potion-base-8M")
         assert is_downloaded("potion-base-8M") and not part.exists()
-        assert ("/minishlab/potion-base-8M/resolve/main/model.safetensors", "bytes=100-") in hf.requests
+        assert ("/minishlab/potion-base-8M/resolve/abc123/model.safetensors", "bytes=100-") in hf.requests, "at the pinned revision"
+        assert not any(path.startswith("/api/") for path, _ in hf.requests), "no API call: the sizes and hashes are pinned"
         assert load("potion-base-8M").encode(["passport"]).shape == (1, 8)
     finally:
         hf.close()
@@ -126,7 +129,8 @@ def test_a_model_is_downloaded_checked_and_resumed(tmp_path, monkeypatch, home):
 def test_a_corrupt_download_is_refused(tmp_path, monkeypatch, home):
     src = make_model(tmp_path / "src")
     files = {f: (src / f).read_bytes() for f in ("config.json", "tokenizer.json", "model.safetensors")}
-    hf = Server(files, _listing(files, lie_about="model.safetensors"))
+    hf = Server(files)
+    pin(monkeypatch, files, lie_about="model.safetensors")
     monkeypatch.setenv("HF_ENDPOINT", hf.url)
     try:
         with pytest.raises(EmbedError, match="SHA-256"):
@@ -153,3 +157,16 @@ def test_ollama_embeddings_are_normalized_and_never_proxied(monkeypatch):
         assert ollama.requests[-1][1]["model"] == "bge-m3"
     finally:
         ollama.close()
+
+
+def test_the_tokenizer_facts_are_worked_out_once(model_path):
+    import os
+
+    first = StaticModel(model_path)
+    cache = model_path / "sfind-facts.json"
+    assert cache.is_file() and json.loads(cache.read_text())["unk"] == first.unk == 0
+    cache.write_text(json.dumps({**json.loads(cache.read_text()), "median_token_length": 99}))
+    assert StaticModel(model_path).median_token_length == 99, "read from the file, not worked out again"
+    st = (model_path / "tokenizer.json").stat()
+    os.utime(model_path / "tokenizer.json", ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    assert StaticModel(model_path).median_token_length != 99, "a changed tokenizer is worked out again"

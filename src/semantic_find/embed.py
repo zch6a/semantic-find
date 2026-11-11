@@ -14,13 +14,12 @@ this machine is accepted, since the passages are the contents of your files.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,16 +30,34 @@ import numpy as np
 class ModelInfo:
     name: str
     repo: str
+    revision: str  # a fixed commit: the files never change under a pinned hash
+    files: dict  # file name -> (size in bytes, SHA-256)
     languages: str
-    size_mb: int
     note: str
 
+    @property
+    def size_mb(self) -> int:
+        return round(sum(size for size, _ in self.files.values()) / 1048576)
 
+
+# Every file of a built-in model is pinned by size and SHA-256 (taken from Hugging Face's listing and
+# checked against a download), so a mirror in HF_ENDPOINT, or anything in between, cannot change it.
 MODELS = {m.name: m for m in [
-    ModelInfo("potion-multilingual-128M", "minishlab/potion-multilingual-128M", "101 languages, Chinese and English among them", 507,
-              "the default: one model for documents in any language"),
-    ModelInfo("potion-retrieval-32M", "minishlab/potion-retrieval-32M", "English", 125, "trained for search; smaller and better for English-only files"),
-    ModelInfo("potion-base-8M", "minishlab/potion-base-8M", "English", 30, "the smallest; for a quick try"),
+    ModelInfo("potion-multilingual-128M", "minishlab/potion-multilingual-128M", "73908c3438cf03b6a01bcb9611d62b23d0726f08", {
+        "config.json": (271, "595e4cab2093732efd5dbe084fd5c1826b5eea693b73b4c1fd971672867d2e54"),
+        "tokenizer.json": (18616131, "19f1909063da3cfe3bd83a782381f040dccea475f4816de11116444a73e1b6a1"),
+        "model.safetensors": (512361560, "14b5eb39cb4ce5666da8ad1f3dc6be4346e9b2d601c073302fa0a31bf7943397"),
+    }, "101 languages, Chinese and English among them", "the default: one model for documents in any language"),
+    ModelInfo("potion-retrieval-32M", "minishlab/potion-retrieval-32M", "6fc8051fab2a1e0ee76689cf08c853792ac285e7", {
+        "config.json": (202, "63c00d90824c832c04ec1d02b6a983fb90489bf049f29fbff15ba481b8a432ee"),
+        "tokenizer.json": (1493150, "7d75cbc54318138807c401b0f0c9721117c628b39de8e8e0edb6cb17e0ee7d18"),
+        "model.safetensors": (129210456, "07609e5bd33aad37900b3fd62f4ec96f6daec88ca4d46b9d8b928bfababf6ea0"),
+    }, "English", "trained for search; smaller and better for English-only files"),
+    ModelInfo("potion-base-8M", "minishlab/potion-base-8M", "bf8b056651a2c21b8d2565580b8569da283cab23", {
+        "config.json": (202, "2a6ac0e9aaa356a68a5688070db78fc3a464fefe85d2f06a1905ce3718687553"),
+        "tokenizer.json": (683666, "e67e803f624fb4d67dea1c730d06e1067e1b14d830e2c2202569e3ef0f70bb50"),
+        "model.safetensors": (30236760, "f65d0f325faadc1e121c319e2faa41170d3fa07d8c89abd48ca5358d9a223de2"),
+    }, "English", "the smallest; for a quick try"),
 ]}
 DEFAULT_MODEL = "potion-multilingual-128M"
 FILES = ("config.json", "tokenizer.json", "model.safetensors")
@@ -67,7 +84,8 @@ def model_dir(name: str) -> Path:
 
 def is_downloaded(name: str) -> bool:
     d = model_dir(name)
-    return all((d / f).is_file() for f in FILES)
+    files = MODELS[name].files if name in MODELS else dict.fromkeys(FILES, (None, None))
+    return all((d / f).is_file() and (size is None or (d / f).stat().st_size == size) for f, (size, _) in files.items())
 
 
 # ---------------------------------------------------------------- safetensors, read with numpy
@@ -79,8 +97,11 @@ def read_safetensors(path: Path) -> dict[str, np.ndarray]:
     """The tensors of a .safetensors file, memory-mapped: an 8-byte header length, a JSON header, then the data."""
     with open(path, "rb") as f:
         n = int.from_bytes(f.read(8), "little")
+        if not 0 < n < 100_000_000:
+            raise EmbedError(f"{path.name} is not a safetensors file")
         header = json.loads(f.read(n))
     base = 8 + n
+    file_size = path.stat().st_size
     out = {}
     for key, meta in header.items():
         if key == "__metadata__":
@@ -90,8 +111,8 @@ def read_safetensors(path: Path) -> dict[str, np.ndarray]:
             raise EmbedError(f"{path.name}: tensor {key} has an unsupported type {meta['dtype']}")
         start, end = meta["data_offsets"]
         count = int(np.prod(meta["shape"])) if meta["shape"] else 1
-        if end - start != count * np.dtype(dtype).itemsize:
-            raise EmbedError(f"{path.name}: tensor {key} has the wrong size")
+        if end - start != count * np.dtype(dtype).itemsize or start < 0 or base + end > file_size:
+            raise EmbedError(f"{path.name}: tensor {key} has the wrong size or lies outside the file")
         out[key] = np.memmap(path, dtype=dtype, mode="r", offset=base + start, shape=tuple(meta["shape"]))
     return out
 
@@ -121,11 +142,30 @@ class StaticModel:
         self.normalize = bool(config.get("normalize", True))
         self.max_length = int(config.get("max_length") or 512)
         self.dim = int(emb.shape[1])
-        self.unk = self._unk_id()
-        vocab = self.tokenizer.get_vocab()
-        self.median_token_length = max(1, int(np.median([len(t) for t in vocab]))) if vocab else 1
+        self.unk, self.median_token_length = self._facts()
         self.tokenizer.no_padding()
         self.tokenizer.enable_truncation(self.max_length)
+
+    def _facts(self) -> tuple[int | None, int]:
+        """The unknown token's id and the median token length. Working them out takes half a second for
+        a 500,000-token vocabulary, on every search, so they are kept in a small file next to the model,
+        tied to the tokenizer file's size and modification time."""
+        tok_file = self.path / "tokenizer.json"
+        st = tok_file.stat()
+        stamp = [st.st_size, st.st_mtime_ns]
+        cache = self.path / "sfind-facts.json"
+        try:
+            facts = json.loads(cache.read_text(encoding="utf-8"))
+            if facts.get("tokenizer") == stamp:
+                return facts["unk"], int(facts["median_token_length"])
+        except (OSError, ValueError, KeyError):
+            pass
+        vocab = self.tokenizer.get_vocab()
+        median = max(1, int(np.median([len(t) for t in vocab]))) if vocab else 1
+        unk = self._unk_id()
+        with contextlib.suppress(OSError):  # a read-only model folder: worked out each time
+            cache.write_text(json.dumps({"tokenizer": stamp, "unk": unk, "median_token_length": median}), encoding="utf-8")
+        return unk, median
 
     def _unk_id(self) -> int | None:
         model = json.loads(self.tokenizer.to_str())["model"]
@@ -163,7 +203,7 @@ def is_local(url: str) -> bool:
     if host == "localhost" or host.endswith(".localhost"):
         return True
     try:
-        return ipaddress.ip_address(host).is_loopback
+        return ipaddress.ip_address(host).is_loopback or host in ("0.0.0.0", "::")
     except ValueError:
         return False
 
@@ -176,15 +216,22 @@ class OllamaModel:
         self.url = (url or os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").rstrip("/")
         if "://" not in self.url:
             self.url = "http://" + self.url
+        # OLLAMA_HOST=0.0.0.0 is how Ollama is told to listen on every interface; it is reached here.
+        self.url = self.url.replace("//0.0.0.0", "//127.0.0.1").replace("//[::]", "//[::1]")
         if not is_local(self.url):
             raise EmbedError(f"{self.url} is not on this machine; semantic-find sends the contents of your files only to a local server")
         if self.model.endswith(("-cloud", ":cloud")):
             raise EmbedError(f"\"{self.model}\" is an Ollama cloud model: it runs on Ollama's servers, not here")
+        import urllib.request
+
         self.timeout = timeout
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never through a proxy
         self.dim = len(self.encode(["dimension probe"])[0])
 
     def encode(self, texts: list[str], batch: int = 64) -> np.ndarray:
+        import urllib.error
+        import urllib.request
+
         rows = []
         for start in range(0, len(texts), batch):
             body = json.dumps({"model": self.model, "input": texts[start:start + batch], "truncate": True}).encode()
@@ -227,58 +274,59 @@ def endpoint() -> str:
     return (os.environ.get("HF_ENDPOINT") or "https://huggingface.co").rstrip("/")
 
 
-def _listing(repo: str) -> dict[str, dict]:
-    url = f"{endpoint()}/api/models/{repo}/tree/main"
-    with urllib.request.urlopen(url, timeout=30) as r:
-        return {f["path"]: f for f in json.loads(r.read().decode("utf-8")) if f.get("type") == "file"}
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 def download(name: str, progress=None) -> Path:
-    """Fetch a built-in model's three files, resuming a partial download, and check each one's size and
-    (for the large files Hugging Face stores with Git LFS) its SHA-256. Returns the model's folder."""
+    """Fetch a built-in model's files at its pinned revision, resuming a partial download, and check each
+    against its pinned size and SHA-256. Returns the model's folder."""
     if name not in MODELS:
         raise EmbedError(f"unknown model \"{name}\"; built in: {', '.join(MODELS)}")
+    import urllib.error
+    import urllib.request
+
     info = MODELS[name]
     target = model_dir(name)
     target.mkdir(parents=True, exist_ok=True)
-    try:
-        listing = _listing(info.repo)
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        raise EmbedError(f"could not reach {endpoint()} ({e}); set HF_ENDPOINT to a mirror, or download the files by hand into {target}") from e
-    for file in FILES:
-        meta = listing.get(file)
-        if meta is None:
-            raise EmbedError(f"{info.repo} has no {file}")
-        size = int(meta.get("size") or 0)
-        sha = (meta.get("lfs") or {}).get("oid")
+    for file, (size, sha) in info.files.items():
         final = target / file
         if final.is_file() and final.stat().st_size == size:
             continue
         part = final.with_suffix(final.suffix + ".part")
         have = part.stat().st_size if part.exists() else 0
-        req = urllib.request.Request(f"{endpoint()}/{info.repo}/resolve/main/{file}", headers={"Range": f"bytes={have}-"} if have else {})
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have and r.status == 206 else "wb") as out:
-                done = have if r.status == 206 else 0
-                while True:
-                    block = r.read(1 << 20)
-                    if not block:
-                        break
-                    out.write(block)
-                    done += len(block)
-                    if progress:
-                        progress(file, done, size)
-        except (urllib.error.URLError, OSError) as e:
-            raise EmbedError(f"downloading {file} failed ({e}); run the command again to resume") from e
+        if have > size:
+            part.unlink()  # not this file: start again
+            have = 0
+        if have < size:
+            url = f"{endpoint()}/{info.repo}/resolve/{info.revision}/{file}"
+            req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have and r.status == 206 else "wb") as out:
+                    done = have if r.status == 206 else 0
+                    while True:
+                        block = r.read(1 << 20)
+                        if not block:
+                            break
+                        out.write(block)
+                        done += len(block)
+                        if progress:
+                            progress(file, done, size)
+            except urllib.error.HTTPError as e:
+                if e.code == 416 and part.exists():  # the server says the range is past the end: start again
+                    part.unlink()
+                raise EmbedError(f"downloading {file} from {endpoint()} failed ({e}); run the command again") from e
+            except (urllib.error.URLError, OSError) as e:
+                raise EmbedError(f"could not download {file} from {endpoint()} ({e}); run the command again to resume, "
+                                 f"or set HF_ENDPOINT to a mirror (such as https://hf-mirror.com)") from e
         if part.stat().st_size != size:
             raise EmbedError(f"{file} is {part.stat().st_size} bytes, not {size}; run the command again to resume")
-        if sha:
-            h = hashlib.sha256()
-            with open(part, "rb") as f:
-                for block in iter(lambda: f.read(1 << 20), b""):
-                    h.update(block)
-            if h.hexdigest() != sha:
-                part.unlink()
-                raise EmbedError(f"{file} does not match its SHA-256 on Hugging Face; it was deleted, run the command again")
+        if _sha256(part) != sha:
+            part.unlink()
+            raise EmbedError(f"{file} does not match its pinned SHA-256; it was deleted. Run the command again, or try another mirror")
         os.replace(part, final)
     return target

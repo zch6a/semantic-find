@@ -17,4 +17,4 @@ jobs:
       - run: uv pip install -e ".[pdf]" pytest ruff
       - run: uv run --no-project sfind --version
       - run: uv run --no-project pytest -q
-      - run: uv run --no-project ruff check src tests
+      - run: uv run --no-project ruff check src tests eval

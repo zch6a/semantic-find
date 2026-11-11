@@ -8,6 +8,7 @@ spaces between words, so a run of their characters is indexed as overlapping pai
 
 from __future__ import annotations
 
+import functools
 import html.parser
 import io
 import json
@@ -16,29 +17,37 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-CJK = "぀-ヿ㐀-䶿一-鿿가-힯豈-﫿"
+CJK = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff"  # kana, CJK ideographs, Hangul
 _TOKEN = re.compile(rf"[{CJK}]+|[^\W_{CJK}]+(?:[_'’][^\W_{CJK}]+)*")
 _CAMEL = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+_JOINERS = re.compile(r"[_'’]")
 _CJK_RUN = re.compile(rf"^[{CJK}]+$")
+
+
+@functools.lru_cache(maxsize=200_000)
+def _word_terms(tok: str) -> tuple[str, ...]:
+    """The terms of one word. Words repeat all the time (in code above all), so each is worked out
+    once: this made indexing about twice as fast."""
+    if _CJK_RUN.match(tok):
+        return tuple(tok[i:i + 2] for i in range(len(tok) - 1)) if len(tok) > 1 else (tok,)
+    parts = [p.lower() for piece in _JOINERS.split(tok) for p in _CAMEL.findall(piece)]
+    return (tok.lower(), *parts) if len(parts) > 1 else (tok.lower(),)
+
+
+def index_terms(text: str) -> list[str]:
+    """The terms a passage is indexed under: its keyword terms, and for CJK text each character too, so
+    that a one-character query ("车") finds "汽车" and "车坏了"."""
+    out = terms(text)
+    out.extend(c for run in re.findall(rf"[{CJK}]{{2,}}", text) for c in run)
+    return out
 
 
 def terms(text: str) -> list[str]:
     """Keyword terms: words in lower case, identifiers also split into their parts ("parseHttpRequest"
     gives "parsehttprequest", "parse", "http", "request"), and CJK text as character pairs."""
     out: list[str] = []
-    for m in _TOKEN.finditer(text):
-        tok = m.group(0)
-        if _CJK_RUN.match(tok):
-            if len(tok) > 1:
-                out.extend(tok[i:i + 2] for i in range(len(tok) - 1))
-            else:
-                out.append(tok)
-            continue
-        low = tok.lower()
-        out.append(low)
-        parts = [p.lower() for piece in re.split(r"[_'’]", tok) for p in _CAMEL.findall(piece)]
-        if len(parts) > 1:
-            out.extend(parts)
+    for tok in _TOKEN.findall(text):
+        out.extend(_word_terms(tok))
     return out
 
 
@@ -170,9 +179,45 @@ BINARY = {
 }
 
 
+LEGACY = ("gb18030", "big5", "shift_jis", "euc_kr", "cp1252")
+
+
+def _common(enc: str, ch: str) -> bool:
+    """Whether a character is an everyday one in the script that `enc` is for. Text decoded with the
+    wrong encoding is full of rare characters (cp1252 "Crème" read as GB18030 is "Cr鑝e"), so the share of
+    everyday ones tells the right decoding from the wrong ones."""
+    o = ord(ch)
+    if enc == "gb18030":
+        try:
+            b = ch.encode("gb2312")
+        except UnicodeEncodeError:
+            return False
+        return len(b) == 2 and (0xB0 <= b[0] <= 0xD7 or b[0] in (0xA1, 0xA3))  # the 3,755 common hanzi; punctuation
+    if enc == "big5":
+        try:
+            b = ch.encode("big5")
+        except UnicodeEncodeError:
+            return False
+        return len(b) == 2 and (0xA4 <= b[0] <= 0xC6 or b[0] == 0xA1)  # frequent hanzi; punctuation
+    if enc == "shift_jis":
+        if 0x3040 <= o <= 0x30FF or 0x3000 <= o <= 0x303F or 0xFF00 <= o <= 0xFFEF:
+            return True  # kana, punctuation, full-width forms
+        try:
+            b = ch.encode("shift_jis")
+        except UnicodeEncodeError:
+            return False
+        return len(b) == 2 and 0x88 <= b[0] <= 0x9F  # JIS level-1 kanji
+    if enc == "euc_kr":
+        return 0xAC00 <= o <= 0xD7A3 or 0x3000 <= o <= 0x303F  # Hangul syllables
+    if enc == "cp1252":
+        return (ch.isalpha() and o < 0x250) or ch in "‘’“”–—…€•°±·×÷§©®™«»¿¡"
+    return False
+
+
 def decode(data: bytes) -> str | None:
-    """Text from bytes, or None for a binary file. UTF-8 first, then UTF-16 with a byte-order mark, then
-    GB18030, which many older Chinese documents use."""
+    """Text from bytes, or None for a binary file. UTF-16 with a byte-order mark, then UTF-8; failing
+    those, the legacy encoding (GB18030, Big5, Shift-JIS, EUC-KR or Windows-1252) whose reading is made
+    most of everyday characters."""
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
         try:
             return data.decode("utf-16")
@@ -180,12 +225,29 @@ def decode(data: bytes) -> str | None:
             return None
     if b"\x00" in data[:8192]:
         return None
-    for enc in ("utf-8-sig", "gb18030"):
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    best: tuple[float, str] | None = None
+    sample = data[:65536]
+    for enc in LEGACY:
         try:
-            return data.decode(enc)
+            text = sample.decode(enc)
         except UnicodeDecodeError:
-            continue
-    return None
+            try:  # the sample may end in the middle of a character
+                text = sample[:-3].decode(enc)
+            except UnicodeDecodeError:
+                continue
+        wide = [c for c in text if ord(c) > 0x7F]
+        score = sum(_common(enc, c) for c in wide) / len(wide) if wide else 1.0
+        if enc == "euc_kr" and wide and len(re.findall(r"[^\x00-\x7f] [^\x00-\x7f]", text)) * 8 >= len(wide):
+            score += 0.01  # Korean puts spaces between words; Chinese, read from the same bytes, does not
+        if best is None or score > best[0]:
+            best = (score, enc)
+    if best is None:
+        return None
+    return data.decode(best[1], errors="replace")
 
 
 class _HTMLText(html.parser.HTMLParser):
@@ -221,47 +283,114 @@ def _html(text: str) -> str:
     return re.sub(r"\n\s*\n+", "\n\n", "".join(p.parts)).strip()
 
 
-def _xml_text(xml: bytes, paragraph: str, run: str) -> str:
-    """The text of an Office Open XML or OpenDocument part: one line per paragraph."""
+ZIP_BUDGET = 200 * 1024 * 1024  # bytes unpacked from one document, at most: a "zip bomb" is skipped, not unpacked
+ZIP_MEMBERS = 5000
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _ooxml(xml: bytes, paragraph: str = "p") -> str:
+    """The text of an Office Open XML part: one line per paragraph, tabs and line breaks kept. A paragraph
+    inside another (in a text box) is its own line, not repeated in the outer one."""
     from xml.etree import ElementTree
 
-    root = ElementTree.fromstring(xml)
-    lines = []
-    for p in root.iter():
-        if p.tag.endswith("}" + paragraph):
-            lines.append("".join(t.text or "" for t in p.iter() if t.tag.endswith("}" + run)))
+    lines: list[str] = []
+
+    def walk(el, buf):
+        name = _local(el.tag)
+        if name == paragraph:
+            mine: list[str] = []
+            for c in el:
+                walk(c, mine)
+            lines.append("".join(mine))
+            return
+        if buf is not None:
+            if name == "t":
+                buf.append(el.text or "")
+            elif name == "tab":
+                buf.append("\t")
+            elif name in ("br", "cr"):
+                buf.append("\n")
+        for c in el:
+            walk(c, buf)
+
+    walk(ElementTree.fromstring(xml), None)
+    return "\n".join(lines)
+
+
+def _odf(xml: bytes) -> str:
+    """The text of an OpenDocument content.xml: paragraphs and headings, with tabs, line breaks and runs
+    of spaces as they are written."""
+    from xml.etree import ElementTree
+
+    lines: list[str] = []
+
+    def walk(el, buf):
+        name = _local(el.tag)
+        if name in ("p", "h"):
+            mine: list[str] = [el.text or ""]
+            for c in el:
+                walk(c, mine)
+            lines.append("".join(mine))
+        else:
+            if buf is not None:
+                if name == "tab":
+                    buf.append("\t")
+                elif name == "line-break":
+                    buf.append("\n")
+                elif name == "s":
+                    count = next((v for k, v in el.attrib.items() if _local(k) == "c"), "1")
+                    buf.append(" " * (int(count) if count.isdigit() else 1))
+                elif el.text:
+                    buf.append(el.text)
+            for c in el:
+                walk(c, buf)
+        if buf is not None and el.tail:
+            buf.append(el.tail)
+
+    walk(ElementTree.fromstring(xml), None)
     return "\n".join(lines)
 
 
 def _office(path: Path, data: bytes) -> str:
     with zipfile.ZipFile(io.BytesIO(data)) as z:
-        names = z.namelist()
+        infos = {i.filename: i for i in z.infolist()}
+        if len(infos) > ZIP_MEMBERS:
+            raise ValueError("too many parts")
+        spent = 0
+
+        def read(name: str) -> bytes:
+            nonlocal spent
+            spent += infos[name].file_size
+            if spent > ZIP_BUDGET:
+                raise ValueError("too large unpacked")  # never unpacked: the declared size is checked first
+            with z.open(name) as f:
+                out = f.read(infos[name].file_size + 1)
+            if len(out) > infos[name].file_size:
+                raise ValueError("larger than it says")
+            return out
+
+        names = list(infos)
         ext = path.suffix.lower()
         if ext == ".docx":
             parts = ["word/document.xml"] + sorted(n for n in names if re.match(r"word/(footnotes|endnotes)\.xml$", n))
-            return "\n\n".join(_xml_text(z.read(n), "p", "t") for n in parts if n in names)
+            return "\n\n".join(_ooxml(read(n)) for n in parts if n in infos)
         if ext == ".pptx":
             slides = sorted((n for n in names if re.match(r"ppt/slides/slide\d+\.xml$", n)), key=lambda n: int(re.findall(r"\d+", n)[-1]))
-            return "\n\n".join(f"# Slide {i}\n" + _xml_text(z.read(n), "p", "t") for i, n in enumerate(slides, start=1))
+            return "\n\n".join(f"# Slide {i}\n" + _ooxml(read(n)) for i, n in enumerate(slides, start=1))
         if ext == ".xlsx":
-            return _xml_text(z.read("xl/sharedStrings.xml"), "si", "t") if "xl/sharedStrings.xml" in names else ""
+            out = [_ooxml(read("xl/sharedStrings.xml"), "si")] if "xl/sharedStrings.xml" in infos else []
+            sheets = sorted(n for n in names if re.match(r"xl/worksheets/sheet\d+\.xml$", n))
+            out += [_ooxml(read(n), "is") for n in sheets]  # text typed into cells directly ("inline strings")
+            return "\n".join(x for x in out if x.strip())
         if ext in (".odt", ".odp", ".ods"):
-            return _odf(z.read("content.xml"))
+            return _odf(read("content.xml"))
         if ext == ".epub":
             docs = sorted(n for n in names if n.endswith((".xhtml", ".html", ".htm")))
-            return "\n\n".join(_html(z.read(n).decode("utf-8", "replace")) for n in docs)
+            return "\n\n".join(_html(read(n).decode("utf-8", "replace")) for n in docs)
     return ""
-
-
-def _odf(xml: bytes) -> str:
-    from xml.etree import ElementTree
-
-    root = ElementTree.fromstring(xml)
-    lines = []
-    for el in root.iter():
-        if el.tag.endswith("}p") or el.tag.endswith("}h"):
-            lines.append("".join(el.itertext()))
-    return "\n".join(lines)
 
 
 def _pdf(data: bytes) -> str | None:
@@ -269,16 +398,19 @@ def _pdf(data: bytes) -> str | None:
         from pypdf import PdfReader
     except ImportError:
         return None  # reading PDF needs the optional extra: pip install "semantic-find[pdf]"
-    reader = PdfReader(io.BytesIO(data))
-    return "\f".join((page.extract_text() or "") for page in reader.pages)
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        return "\f".join((page.extract_text() or "") for page in reader.pages)
+    except Exception:  # noqa: BLE001 - pypdf raises many kinds of error for a damaged or encrypted file: no text
+        return None
 
 
 def _notebook(text: str) -> str:
     nb = json.loads(text)
     cells = []
-    for c in nb.get("cells", []):
-        src = c.get("source", "")
-        cells.append("".join(src) if isinstance(src, list) else str(src))
+    for c in (nb.get("cells") or []) if isinstance(nb, dict) else []:
+        src = c.get("source", "") if isinstance(c, dict) else ""
+        cells.append("".join(map(str, src)) if isinstance(src, list) else str(src or ""))
     return "\n\n".join(cells)
 
 

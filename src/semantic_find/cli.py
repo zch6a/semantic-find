@@ -12,12 +12,13 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 from pathlib import Path
 
 from . import __version__
 from .embed import DEFAULT_MODEL, MODELS, EmbedError, download, is_downloaded, load, model_dir
-from .index import Hit, Index, index_path
+from .index import Busy, Hit, Index, index_path
 
 COMMANDS = {"index", "status", "forget", "models", "search"}
 
@@ -34,9 +35,21 @@ def _interactive() -> bool:
     return sys.stdin.isatty() and sys.stderr.isatty()
 
 
+_last_tenth: dict[str, int] = {}
+
+
 def _progress_bar(file: str, done: int, total: int) -> None:
-    if total and sys.stderr.isatty():
+    """On a terminal, one line that updates; elsewhere (a log, a CI job, a background process), a line
+    at each tenth, so that a slow download is never silent."""
+    if not total:
+        return
+    if sys.stderr.isatty():
         print(f"\r  {file}: {done / 1048576:6.1f} of {total / 1048576:.1f} MB", end="", file=sys.stderr, flush=True)
+        return
+    tenth = done * 10 // total
+    if tenth > _last_tenth.get(file, -1) and total > 4 * 1048576:
+        _last_tenth[file] = tenth
+        print(f"  {file}: {tenth * 10}% of {total / 1048576:.0f} MB", file=sys.stderr, flush=True)
 
 
 def get_model(name: str, *, ask: bool):
@@ -70,7 +83,11 @@ def _update(idx: Index, model, name: str, quiet: bool) -> None:
         if not quiet:
             print(f"\rsfind: {msg}...", end="", file=sys.stderr, flush=True)
 
-    st = idx.update(model, name if model is not None else None, progress=progress if _interactive() else None)
+    try:
+        st = idx.update(model, name if model is not None else None, progress=progress if _interactive() else None)
+    except Busy:
+        _err(f"another sfind is updating the index of {idx.root}; searching it as it is")
+        return
     if not quiet and (st.read or st.removed or st.embedded):
         print("\r", end="", file=sys.stderr)
         parts = [f"{st.read} file{'s' if st.read != 1 else ''} read"]
@@ -156,6 +173,9 @@ def cmd_search(args) -> int:
         try:
             if not args.no_update:
                 _update(idx, model, name, args.quiet)
+            elif model is not None and idx.meta("model") and idx.meta("model") != name:
+                raise RuntimeError(f"the index of {idx.root} was built with {idx.meta('model')}, not {name}: "
+                                   f"search without --no-update to embed it again, or pass --model {idx.meta('model')}")
             for hit in idx.search(query, model, k=args.top, mode=args.mode if model is not None else "keyword", glob=args.glob,
                                   per_file=not args.all):
                 results.append((idx.root, hit))
@@ -308,33 +328,37 @@ def _looks_like_path(a: str) -> bool:
 
 
 def _split_search(argv: list[str]) -> list[str]:
-    """`sfind QUERY [PATH...]`: the words before the first argument that is a path are the query, the
-    rest are paths. `sfind search ... --in PATH` is the explicit form."""
+    """`sfind QUERY [PATH...]`: the paths are the arguments at the end that are (or would be) paths, so a
+    query word that happens to name a folder ("how tests work") stays a word. `sfind search ... --in
+    PATH` is the explicit form."""
     if not argv or argv[0] in COMMANDS or argv[0] in ("-h", "--help", "--version"):
         return argv
-    words, paths, opts = [], [], []
-    it = iter(range(len(argv)))
     takes_value = {"-k", "--top", "-g", "--glob", "--mode", "--model", "--in"}
-    for i in it:
+    plain, opts = [], []
+    i = 0
+    while i < len(argv):
         a = argv[i]
         if a.startswith("-") and len(a) > 1:
             opts.append(a)
             if a in takes_value and i + 1 < len(argv):
                 opts.append(argv[i + 1])
-                next(it, None)
-        elif words and _looks_like_path(a):
-            paths.append(a)
-        elif paths:
-            paths.append(a)  # (a path that does not exist: reported when it is opened)
+                i += 1
         else:
-            words.append(a)
+            plain.append(a)
+        i += 1
+    n_paths = 0
+    while n_paths < len(plain) - 1 and _looks_like_path(plain[len(plain) - 1 - n_paths]):
+        n_paths += 1  # (the first word is always the query)
+    words, paths = plain[:len(plain) - n_paths], plain[len(plain) - n_paths:]
     return ["search", *words, *opts, *(["--in", *paths] if paths else [])]
 
 
 def main(argv: list[str] | None = None) -> int:
     """Exit codes: 0 found something, 1 found nothing, 2 could not search."""
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(errors="replace")
+        # Into a pipe or a file, UTF-8, so that file names come through whole for the next program; on a
+        # console, its own encoding, with what it cannot show replaced.
+        sys.stdout.reconfigure(errors="replace", **({} if sys.stdout.isatty() else {"encoding": "utf-8"}))
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(_split_search(argv))
@@ -345,8 +369,13 @@ def main(argv: list[str] | None = None) -> int:
         args.paths = ["."]
     try:
         return {"search": cmd_search, "index": cmd_index, "status": cmd_status, "forget": cmd_forget, "models": cmd_models}[args.command](args)
-    except (EmbedError, OSError, RuntimeError, ValueError) as e:
+    except (EmbedError, OSError, RuntimeError, ValueError, sqlite3.Error) as e:
         _err(str(e))
+        return 2
+    except Exception as e:  # noqa: BLE001 - never a traceback, and never exit 1, which means "nothing found"
+        if os.environ.get("SFIND_DEBUG"):
+            raise
+        _err(f"unexpected error: {type(e).__name__}: {e} (run with SFIND_DEBUG=1 for details, and please report it)")
         return 2
     except KeyboardInterrupt:
         print(file=sys.stderr)

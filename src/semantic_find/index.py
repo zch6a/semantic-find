@@ -2,16 +2,27 @@
 
 It holds, for each file, its size and modification time (so that only changed files are read again),
 its passages with their line numbers, the keyword terms of each passage in an FTS5 table (BM25 ranking),
-and each passage's vector as float16. Searching ranks passages both ways and fuses the two rankings
-with reciprocal-rank fusion (RRF): a passage high in either list comes out high, one high in both
-comes out on top.
+and each passage's vector as float16.
+
+Searching scores each candidate passage as
+
+    similarity / best similarity  +  KEYWORD_WEIGHT × the share of the query's words it contains
+
+(words weighted by rarity). Reciprocal-rank fusion, the usual way to merge two rankings, was tried first
+and measured on eval/: it lets a passage that shares one word of four with the query outrank the one
+that means what was asked, and with the default model it found the right file first for only 22% of
+queries across languages, against 44% this way, with no loss within one language.
 """
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import hashlib
+import math
+import os
 import sqlite3
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -21,20 +32,58 @@ import numpy as np
 
 from .embed import data_home
 from .files import MAX_FILE, discover
-from .text import HEADED, join_pairs, passages, query_terms, read_text, terms
+from .text import HEADED, index_terms, join_pairs, passages, query_terms, read_text, terms
 
 SCHEMA = 1
-RRF_K = 60  # the usual constant: it damps the difference between rank 1 and rank 2
 CANDIDATES = 300  # from each ranking, before fusing
 # A passage found only by meaning is kept when it is at least this close to the best one: a ranking by
 # similarity always has a "best", so without a floor every search would fill its list with noise.
 RELATIVE_FLOOR = 0.5
 MIN_SIMILARITY = 0.1  # and never below this, however weak the best one is
+# How much a passage containing all of the query's words gains over one that only means the same.
+# Chosen on eval/ (0.2 to 1.5 tried): lower helps queries across languages and costs ones within one.
+KEYWORD_WEIGHT = 0.5
+
+
+COMMIT_EVERY = 200  # files: an interrupted first index keeps what it has done
 
 
 def index_path(root: Path) -> Path:
-    key = hashlib.sha256(str(root.resolve()).lower().encode("utf-8")).hexdigest()[:20]
+    name = str(root.resolve())
+    if sys.platform in ("win32", "darwin"):  # file names there ignore case: C:\Notes is c:\notes
+        name = name.lower()
+    key = hashlib.sha256(name.encode("utf-8")).hexdigest()[:20]
     return data_home() / "indexes" / f"{key}.sqlite"
+
+
+class Busy(RuntimeError):
+    """Another sfind is updating this index."""
+
+
+@contextlib.contextmanager
+def updating(db_path: Path):
+    """One updater at a time per index, held with an OS file lock (released if the process dies)."""
+    with open(db_path.with_name(db_path.name + ".lock"), "a+b") as lock:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            raise Busy("another sfind is updating this index") from e
+        yield  # closing the file releases the lock
+
+
+def _private(path: Path) -> None:
+    """The index holds the text of your files: readable by you only (on systems with file modes)."""
+    if sys.platform != "win32":
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
 
 
 @dataclass
@@ -66,7 +115,11 @@ class Index:
         self.root = root.resolve()
         self.path = path or index_path(self.root)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path)
+        if sys.platform != "win32":
+            with contextlib.suppress(OSError):
+                os.chmod(self.path.parent, 0o700)
+        self.db = sqlite3.connect(self.path, timeout=30)
+        _private(self.path)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self._create()
@@ -83,6 +136,7 @@ class Index:
                 line INTEGER, page INTEGER, text TEXT, context TEXT, vec BLOB);
             CREATE INDEX IF NOT EXISTS passages_file ON passages(file_id);
             CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(body, path, tokenize='unicode61 remove_diacritics 2');
+            CREATE VIRTUAL TABLE IF NOT EXISTS fts_vocab USING fts5vocab(fts, 'row');
         """)
         if self.meta("schema") is None:
             self.set_meta("schema", str(SCHEMA))
@@ -102,7 +156,12 @@ class Index:
 
     def update(self, model=None, model_name: str | None = None, progress: Callable[[str], None] | None = None) -> Stats:
         """Bring the index up to date with the folder: read new and changed files, drop deleted ones, and
-        give every passage a vector from `model` (all of them again if the model changed)."""
+        give every passage a vector from `model` (all of them again if the model changed). Raises Busy
+        when another sfind is doing it."""
+        with updating(self.path):
+            return self._update(model, model_name, progress)
+
+    def _update(self, model, model_name, progress) -> Stats:
         t0 = time.perf_counter()
         st = Stats()
         if model is not None and self.meta("model") != model_name:
@@ -119,6 +178,8 @@ class Index:
             rel = path.relative_to(self.root).as_posix() if path != self.root else path.name
             if info.st_size > MAX_FILE:
                 continue
+            if rel in seen:
+                continue  # git lists a file in a merge conflict once per side
             seen.add(rel)
             st.files += 1
             old = known.get(rel)
@@ -128,7 +189,7 @@ class Index:
                 self._remove(old[0], rel)
             try:
                 text = read_text(path)
-            except OSError:
+            except Exception:  # noqa: BLE001 - one unreadable file must not stop the rest; it counts as skipped
                 text = None
             cur = self.db.execute("INSERT INTO files(path, size, mtime_ns) VALUES (?, ?, ?)", (rel, info.st_size, info.st_mtime_ns))
             st.read += 1
@@ -140,10 +201,12 @@ class Index:
                 c = self.db.execute("INSERT INTO passages(file_id, line, page, text, context) VALUES (?, ?, ?, ?, ?)",
                                     (cur.lastrowid, p.line, p.page, p.text, p.context))
                 self.db.execute("INSERT INTO fts(rowid, body, path) VALUES (?, ?, ?)",
-                                (c.lastrowid, " ".join(terms(p.context + "\n" + p.text)), path_terms))
+                                (c.lastrowid, " ".join(index_terms(p.context + "\n" + p.text)), path_terms))
                 st.passages += 1
-            if progress and st.read % 200 == 0:
-                progress(f"read {st.read} files")
+            if st.read % COMMIT_EVERY == 0:
+                self.db.commit()
+                if progress:
+                    progress(f"read {st.read} files")
         for rel, (fid, _, _) in known.items():
             if rel not in seen:
                 self._remove(fid, rel)
@@ -183,27 +246,84 @@ class Index:
         n, with_vec = self.db.execute("SELECT COUNT(*), COUNT(vec) FROM passages").fetchone()
         return {"files": files, "passages": n, "embedded": with_vec}
 
-    def _load_vectors(self) -> tuple[np.ndarray, np.ndarray]:
+    def _load_vectors(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self._vectors is None:
-            rows = self.db.execute("SELECT id, vec FROM passages WHERE vec IS NOT NULL").fetchall()
+            rows = self.db.execute("SELECT id, file_id, vec FROM passages WHERE vec IS NOT NULL").fetchall()
             dim = int(self.meta("dim") or 0)
             ids = np.fromiter((r[0] for r in rows), dtype=np.int64, count=len(rows))
-            mat = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float16).reshape(len(rows), dim) if rows else np.zeros((0, dim), np.float16)
-            self._vectors = (ids, mat)
+            files = np.fromiter((r[1] for r in rows), dtype=np.int64, count=len(rows))
+            mat = np.frombuffer(b"".join(r[2] for r in rows), dtype=np.float16).reshape(len(rows), dim) if rows else np.zeros((0, dim), np.float16)
+            self._vectors = (ids, files, mat)
         return self._vectors
 
-    def keyword(self, query: str, limit: int = CANDIDATES) -> list[int]:
+    def _allowed_files(self, glob: str | None) -> set[int] | None:
+        """The files a -g pattern lets through (None: all). Applied before ranking, so that the
+        matches in those files are not crowded out of the candidates by others."""
+        if not glob:
+            return None
+        return {fid for fid, path in self.db.execute("SELECT id, path FROM files")
+                if fnmatch.fnmatch(path, glob) or fnmatch.fnmatch(path.rsplit("/", 1)[-1], glob)}
+
+    def keyword(self, query: str, limit: int = CANDIDATES, files: set[int] | None = None) -> list[int]:
         q = query_terms(query)
-        if not q:
+        if not q or files == set():
             return []
         expr = " OR ".join('"' + t.replace('"', '""') + '"' for t in q)
-        rows = self.db.execute("SELECT rowid FROM fts WHERE fts MATCH ? ORDER BY bm25(fts, 1.0, 0.4) LIMIT ?", (expr, limit)).fetchall()
+        if files is None:
+            rows = self.db.execute("SELECT rowid FROM fts WHERE fts MATCH ? ORDER BY bm25(fts, 1.0, 0.4) LIMIT ?", (expr, limit)).fetchall()
+            return [r[0] for r in rows]
+        self.db.execute("CREATE TEMP TABLE IF NOT EXISTS allowed (id INTEGER PRIMARY KEY)")
+        self.db.execute("DELETE FROM allowed")
+        self.db.executemany("INSERT INTO allowed VALUES (?)", [(f,) for f in files])
+        rows = self.db.execute("SELECT rowid FROM fts WHERE fts MATCH ? AND rowid IN "
+                               "(SELECT p.id FROM passages p JOIN allowed a ON a.id = p.file_id) ORDER BY bm25(fts, 1.0, 0.4) LIMIT ?",
+                               (expr, limit)).fetchall()
         return [r[0] for r in rows]
 
-    def semantic(self, vector: np.ndarray, limit: int = CANDIDATES) -> list[tuple[int, float]]:
-        ids, mat = self._load_vectors()
+    def coverage(self, query: str, pids: list[int]) -> dict[int, float]:
+        """For each passage, the share of the query's words it contains, each word weighted by its
+        rarity (IDF). Words that occur nowhere in the index (such as a character pair that spans two
+        Chinese words, "么配" in "怎么配置") are left out of the count."""
+        q = query_terms(query)
+        if not q or not pids:
+            return {}
+        marks = ",".join("?" * len(q))
+        df = dict(self.db.execute(f"SELECT term, doc FROM fts_vocab WHERE term IN ({marks})", q).fetchall())
+        n = self.db.execute("SELECT COUNT(*) FROM fts").fetchone()[0] or 1
+        weight = {t: math.log(1 + n / df[t]) for t in q if df.get(t)}
+        total = sum(weight.values())
+        if not total:
+            return {}
+        out = {}
+        for start in range(0, len(pids), 500):
+            part = pids[start:start + 500]
+            for pid, body, path in self.db.execute(f"SELECT rowid, body, path FROM fts WHERE rowid IN ({','.join('?' * len(part))})", part):
+                have = set(body.split()) | set(path.split())
+                out[pid] = sum(w for t, w in weight.items() if t in have) / total
+        return out
+
+    def similarities(self, vector: np.ndarray, pids: list[int]) -> dict[int, float]:
+        """Similarity of meaning for particular passages (keyword hits beyond the semantic candidates)."""
+        ids, _, mat = self._load_vectors()
+        if not pids or not len(ids):
+            return {}
+        where = {int(p): i for i, p in enumerate(ids)}
+        rows = [(p, where[p]) for p in pids if p in where]
+        if not rows:
+            return {}
+        sims = mat[[r for _, r in rows]].astype(np.float32) @ vector.astype(np.float32)
+        return {p: float(s) for (p, _), s in zip(rows, sims, strict=True)}
+
+    def semantic(self, vector: np.ndarray, limit: int = CANDIDATES, files: set[int] | None = None) -> list[tuple[int, float]]:
+        ids, file_ids, mat = self._load_vectors()
+        if files is not None:
+            keep = np.isin(file_ids, np.fromiter(files, dtype=np.int64, count=len(files)))
+            ids, mat = ids[keep], mat[keep]
         if not len(ids):
             return []
+        if vector.shape[0] != mat.shape[1]:
+            raise RuntimeError(f"the index was built with {self.meta('model')}, whose vectors do not fit this model's; "
+                               "search without --no-update to embed it again, or pass --model " + str(self.meta("model")))
         sims = mat.astype(np.float32) @ vector.astype(np.float32)
         top = np.argsort(-sims)[:limit]
         return [(int(ids[i]), float(sims[i])) for i in top]
@@ -213,22 +333,31 @@ class Index:
         """The best `k` passages for `query` (by default the best one per file). `mode`: "hybrid" (both
         rankings fused), "keyword" or "meaning". A model is needed for meaning; without vectors in the
         index, hybrid is keyword search."""
-        kw = self.keyword(query) if mode in ("hybrid", "keyword") else []
+        allowed = self._allowed_files(glob)
+        kw = self.keyword(query, files=allowed) if mode in ("hybrid", "keyword") else []
         sem: list[tuple[int, float]] = []
+        query_vector = None
         if mode in ("hybrid", "meaning") and model is not None and self.counts()["embedded"]:
-            sem = self.semantic(model.encode([query])[0])
+            query_vector = model.encode([query])[0]
+            sem = self.semantic(query_vector, files=allowed)
         if mode == "meaning" and model is None:
             raise RuntimeError("searching by meaning needs a model")
         score: dict[int, float] = {}
-        for rank, pid in enumerate(kw):
-            score[pid] = score.get(pid, 0.0) + 1.0 / (RRF_K + rank + 1)
         similarity = dict(sem)
         floor = max(MIN_SIMILARITY, sem[0][1] * RELATIVE_FLOOR) if sem else MIN_SIMILARITY
-        found_by_words = set(kw)
-        for rank, (pid, sim) in enumerate(sem):
-            if sim < floor and pid not in found_by_words:
-                continue
-            score[pid] = score.get(pid, 0.0) + 1.0 / (RRF_K + rank + 1)
+        if sem:
+            best = max(sem[0][1], 1e-9)
+            cover = self.coverage(query, kw)
+            if kw:
+                similarity.update(self.similarities(query_vector, [p for p in kw if p not in similarity]))
+            for rank, pid in enumerate(kw):  # BM25's order breaks ties between passages that cover as much
+                score[pid] = KEYWORD_WEIGHT * cover.get(pid, 0.0) * (1 - rank / (10 * len(kw))) + max(similarity.get(pid, 0.0), 0.0) / best
+            for pid, sim in sem:
+                if pid not in score and sim >= floor:
+                    score[pid] = sim / best
+        else:  # keywords alone: BM25's order
+            for rank, pid in enumerate(kw):
+                score[pid] = 1.0 / (rank + 1)
         if not score:
             return []
         order = sorted(score, key=score.get, reverse=True)
