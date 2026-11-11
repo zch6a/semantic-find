@@ -194,22 +194,27 @@ def cmd_search(args) -> int:
                 results.append((idx.root, hit))
         finally:
             idx.close()
+    if any(not h.weak for _, h in results):  # strong results from one folder: the weak ones from another go
+        results = [(r, h) for r, h in results if not h.weak]
     results.sort(key=lambda r: r[1].score, reverse=True)
     results = results[:args.top]
+    found = bool(results) and not all(h.weak for _, h in results)
     if args.json:
         print(json.dumps([{"path": str(root / h.path if root.is_dir() else root), "line": h.line, "page": h.page, "text": h.text,
                            "score": round(h.score, 6), "words": h.words,
                            "similarity": None if h.similarity is None else round(h.similarity, 4), "more": h.more,
-                           "same": [str(root / p) for p in h.same]}
+                           "same": [str(root / p) for p in h.same], "weak": h.weak}
                           for root, h in results], ensure_ascii=False, indent=2))
-        return 0 if results else 1
-    if args.files:  # each matching file once, copies of a passage included
-        for shown in dict.fromkeys(_shown(root, rel) for root, h in results for rel in (h.path, *h.same)):
+        return 0 if found else 1
+    if args.files:  # each matching file once, copies of a passage included; weak matches are not matches
+        for shown in dict.fromkeys(_shown(root, rel) for root, h in results if not h.weak for rel in (h.path, *h.same)):
             print(shown)
-        return 0 if results else 1
+        return 0 if found else 1
     if not results:
         _err("nothing found")
         return 1
+    if not found:
+        _err("no strong match; the closest passages, which may not be what you are looking for:")
     color = _color()
     for root, h in results:
         where = _where(root, h)
@@ -219,7 +224,7 @@ def cmd_search(args) -> int:
         detail = why(h)
         if detail:
             print(f"    \033[2m({detail})\033[0m" if color else f"    ({detail})")
-    return 0
+    return 0 if found else 1
 
 
 def cmd_index(args) -> int:

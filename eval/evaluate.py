@@ -52,7 +52,7 @@ def main() -> int:
         misses = []
         for query, answer, kind in QUERIES:
             for mode in modes:
-                paths = [h.path for h in idx.search(query, model, k=10, mode=mode)]
+                paths = [h.path for h in idx.search(query, model, k=10, mode=mode)]  # weak ones too: they are shown
                 rank = paths.index(answer) + 1 if answer in paths else None
                 for key in (kind, "all"):
                     table[(mode, key)].append(rank)

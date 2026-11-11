@@ -52,8 +52,9 @@ Neither "passport" nor "backoff" was in the query or the file: the match is by m
 - **Small and fast.** The model is a static embedding model ([Model2Vec](https://github.com/MinishLab/model2vec)):
   no neural network runs, so there is no PyTorch and no GPU. The only dependencies are numpy and
   Hugging Face's `tokenizers`.
-- **Only what matches.** A search for something that is not in the folder finds nothing, rather than
-  the least bad passages. Weak matches after a strong one are left out, and copies of the same text are
+- **Says how sure it is.** Weak matches after a strong one are left out. When nothing matches
+  strongly (a search for something that is not in the folder, say), sfind says so and shows the three
+  closest passages as such, exiting with 1 ("nothing found") for scripts. Copies of the same text are
   shown once ("the same text in 24 other files").
 - **Grep-like.** `-g "*.md"` for some files only, `-l` for file names only (of the best `-k`, 10 by
   default, and their copies), `--json` for scripts, exit code 1 when nothing is found and 2 on an error.
@@ -129,12 +130,14 @@ is.
    times the share of the query's words it contains, rarer words weighing more. Reciprocal-rank
    fusion, the usual way to combine two rankings, was tried first and measured worse: it let a passage
    sharing one word of four outrank the one that meant what was asked.
-6. **What is shown**: a passage found only by meaning must be at least half as close as the best one,
-   and in a folder of 500 passages or more it must stand out from the rest: at least three standard
-   deviations above the folder's mean similarity to the query. Measured on 3,000 files, right
-   answers stood 3.6 to 7.9 deviations out, and the best matches for subjects absent from the folder
-   at most 2.8. Results scoring under 60% of the best are dropped, the best passage of each file is
-   shown, and copies of a passage are shown once.
+6. **What is shown**: a passage found only by meaning must be at least half as close as the best one.
+   In a folder of 500 passages or more it counts as a strong match only if it stands out from the rest,
+   at least three standard deviations above the folder's mean similarity to the query; otherwise it is
+   weak, and weak matches are shown only when there is nothing strong. They are labelled rather than
+   dropped because nothing tells them apart reliably: measured on up to 64,000 passages
+   (`eval/standout.py`), the weakest tenth of right answers look just like the best matches for
+   subjects absent from the folder. Results scoring under 60% of the best are dropped, the best passage
+   of each file is shown, and copies of a passage are shown once.
 
 
 ## How well it finds things
@@ -149,11 +152,11 @@ in the other language. "Top 1" is how often the right file comes first.
 | keyword (`--mode keyword`) | 100% | 44% | 0% | 41% | 45% |
 | meaning (`--mode meaning`) | 89% | 71% | 70% | 74% | 91% |
 | **hybrid** (the default) | **100%** | **73%** | 67% | **76%** | **91%** |
-| hybrid, the documents among 3,000 other files (`--haystack 3000`) | 100% | 67% | 37% | 64% | 75% |
+| hybrid, the documents among 3,000 other files (`--haystack 3000`) | 100% | 67% | 43% | 66% | 77% |
 
 The last row is closer to a real folder: the same documents hidden among 3,000 generated notes,
 Office files, PDFs and code on similar subjects. With the English-only `potion-base-8M`, hybrid search
-finds 52% first (53% among the 3,000), and nothing across languages, as expected.
+finds 52% first, and nothing across languages, as expected.
 
 What this means in use: exact names and words are found as with grep; a question in other words
 finds the right file first about three times in four in a small folder, and two in three in a large

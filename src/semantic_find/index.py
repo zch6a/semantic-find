@@ -40,14 +40,18 @@ CANDIDATES = 300  # from each ranking, before fusing
 # similarity always has a "best", so without a floor every search would fill its list with noise.
 RELATIVE_FLOOR = 0.5
 MIN_SIMILARITY = 0.1  # and never below this, however weak the best one is
-# ... and it must stand out from the folder: at least this many standard deviations above the mean
-# similarity of all passages to the query. Measured on a 3,000-file folder: right answers stood 3.6 to
-# 7.9 deviations out, the noise after them, and every match for a word that was not there at all
-# ("bcrypt", "xylophone lessons", "量子计算"), at 2.8 or less. Chosen on eval/ with --haystack 3000. In a small
-# folder there is no background to stand out from (eval/ alone lost 18 points of hit@5 with it), so the
-# test applies only from STANDOUT_FROM passages.
+# A match by meaning alone is "strong" when it stands out from the folder: at least this many standard
+# deviations above the mean similarity of all passages to the query. When there are strong results,
+# the weak ones are not shown; when there are none, the closest few are shown as weak, and the search
+# counts as "nothing found". Weak matches are labelled rather than dropped because no statistic tells
+# them apart reliably: measured with eval/standout.py on 4,000 and 64,000 passages, at the threshold that
+# keeps 90% of right answers (global z 1.7, the rank-20-300 tail z, the gap to the next 20, or raw
+# similarity), at best 30% of searches for subjects absent from the folder were caught; the weakest
+# tenth of right answers look like the best of the noise. Applies from STANDOUT_FROM passages: a small
+# folder has no background to stand out from.
 MIN_STANDOUT = 3.0
 STANDOUT_FROM = 500
+WEAK_SHOWN = 3  # when nothing is strong: how many of the closest are shown
 # How much a passage containing all of the query's words gains over one that only means the same.
 # Chosen on eval/ (100 queries, three models, 0 to 1.5 tried): higher loses queries across languages,
 # lower loses exact names ("bcrypt", "TokenBucket") with the default model.
@@ -123,6 +127,7 @@ class Hit:
     more: int = 0  # other matching passages in the same file
     context: str = ""  # the heading the passage is under
     same: list[str] = field(default_factory=list)  # other files with exactly the same passage
+    weak: bool = False  # found by meaning alone, without standing out: shown only when nothing is strong
 
 
 class Index:
@@ -360,6 +365,7 @@ class Index:
         if mode == "meaning" and model is None:
             raise RuntimeError("searching by meaning needs a model")
         score: dict[int, float] = {}
+        weak: set[int] = set()
         similarity = dict(sem)
         floor = max(MIN_SIMILARITY, sem[0][1] * RELATIVE_FLOOR) if sem else MIN_SIMILARITY
         if sem:
@@ -372,8 +378,12 @@ class Index:
             mean, spread = self.last_spread
             standout = mean + MIN_STANDOUT * max(spread, 1e-6) if self.last_count >= STANDOUT_FROM else -1.0
             for pid, sim in sem:
-                if pid not in score and sim >= floor and sim >= standout:
+                if pid not in score and sim >= floor:
                     score[pid] = sim / best
+                    if sim < standout:
+                        weak.add(pid)
+            if any(pid not in weak for pid in score):
+                score = {pid: s for pid, s in score.items() if pid not in weak}
             top = max(score.values(), default=0.0)
             score = {pid: s for pid, s in score.items() if s >= SCORE_FLOOR * top}
         else:  # keywords alone: BM25's order
@@ -409,10 +419,12 @@ class Index:
                 by_file.setdefault(path, by_text[same_text])
                 continue
             found = join_pairs(query, [t for t in dict.fromkeys(terms(text)) if t in q_terms])
-            hit = Hit(path, line, page, text, score[pid], found, similarity.get(pid), context=context or "")
+            hit = Hit(path, line, page, text, score[pid], found, similarity.get(pid), context=context or "", weak=pid in weak)
             hits.append(hit)
             by_file[path] = hit
             by_text[same_text] = hit
             if len(hits) >= k and not per_file:
                 break
+        if hits and all(h.weak for h in hits):
+            return hits[:min(k, WEAK_SHOWN)]
         return hits[:k]

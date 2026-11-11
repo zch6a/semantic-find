@@ -72,10 +72,12 @@ def test_in_a_large_folder_a_match_by_meaning_must_stand_out(tmp_path, model_pat
     monkeypatch.setattr(ix, "STANDOUT_FROM", 10**9)
     assert idx.search("visa trip", model, mode="meaning"), "without the test, the noise is listed"
     monkeypatch.setattr(ix, "STANDOUT_FROM", 10)
-    assert idx.search("visa trip", model, mode="meaning") == [], "with it, nothing: none stands out"
+    weak = idx.search("visa trip", model, mode="meaning")
+    assert weak and len(weak) <= ix.WEAK_SHOWN and all(h.weak for h in weak), "with it, none stands out: a few, labelled weak"
     (d / "trip.md").write_text("flight visa passport embassy travel", encoding="utf-8")
     idx.update(model, "fake")
-    assert [h.path for h in idx.search("visa trip", model, mode="meaning")] == ["trip.md"]
+    hits = idx.search("visa trip", model, mode="meaning")
+    assert [h.path for h in hits] == ["trip.md"] and not hits[0].weak, "a strong match: the weak ones are not shown"
     idx.close()
 
 
@@ -93,3 +95,21 @@ def test_the_corpus_maker_makes_a_folder_that_indexes(tmp_path, capsys):
     assert out.returncode == 0, out.stderr
     code, found, _ = run(capsys, "insurer plumber invoice", str(tmp_path / "c"), "--mode", "keyword", "-q", "-l")
     assert code == 0 and found.splitlines()[0].replace("\\", "/").endswith("archive/2023/house/insurance-claim.md")
+
+
+def test_when_nothing_is_strong_the_closest_are_shown_but_nothing_counts_as_found(tmp_path, model_path, monkeypatch, capsys):
+    d = tmp_path / "big"
+    d.mkdir()
+    rng = np.random.default_rng(3)
+    words = ["bread", "oven", "dough", "retry", "timeout", "request", "car", "tyres", "engine", "the", "a", "for", "it", "is"]
+    for i in range(40):
+        (d / f"n{i}.md").write_text(" ".join(rng.choice(words, 10)), encoding="utf-8")
+    monkeypatch.setattr(ix, "STANDOUT_FROM", 10)
+    monkeypatch.setattr(ix, "MIN_SIMILARITY", -1.0)
+    monkeypatch.setattr(ix, "RELATIVE_FLOOR", 0.0)
+    code, out, err = run(capsys, "visa trip", str(d), "--model", str(model_path), "--mode", "meaning", "-q")
+    assert code == 1 and "no strong match" in err and out.count(".md:") <= ix.WEAK_SHOWN
+    code, out, _ = run(capsys, "visa trip", str(d), "--model", str(model_path), "--mode", "meaning", "-q", "-l")
+    assert code == 1 and out == "", "for scripts, a weak match is not a match"
+    code, out, _ = run(capsys, "visa trip", str(d), "--model", str(model_path), "--mode", "meaning", "-q", "--json")
+    assert code == 1 and all(r["weak"] for r in json.loads(out))
