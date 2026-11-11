@@ -18,24 +18,27 @@ your notes, documents and code, even when the words are different.
 ---
 
 ```console
-$ sfind "how long does getting a new travel document take" ~/notes
+$ sfind "how long does getting a new travel document take" ~/notes -k 1
 notes/travel.md:1
     Travel — Passport renewal: book an appointment at the post office, bring the old passport
     and two photos. It takes about six weeks.
-    (words: travel · meaning 0.64 · 1 more in this file)
+    (words: travel · meaning 0.55)
 
 $ sfind "exponential backoff when a request fails" src
 src/net.py:1
-    def fetch(url, retries=3): # try again after a pause that doubles each time …
-    (meaning 0.42)
+    def fetch(url, retries=3): # try again after a pause that doubles each time for attempt in …
+    (meaning 0.29)
 ```
 
-Neither "passport" nor "backoff" was in the query or the file: the match is by meaning.
+"Passport" is not in the first query, and "backoff" is not in the file: the match is by meaning.
+(Output as sfind 0.1.0 prints it with the default model, on a folder of four short notes; without
+`-k 1` the first search also lists the code file, weakly, since a folder that small gives no
+background for a match to stand out from.)
 
 ## What it does
 
 - **No setup.** `sfind QUERY [FOLDER]` indexes the folder the first time and searches it. Later
-  searches read again only the files that changed, so they start at once.
+  searches read again only the files that changed.
 - **Words and meaning together.** Each passage is scored by meaning (embedding similarity) and by how
   much of the query's words it contains (rarer words count more). An exact name such as
   `fetchWithRetry` is found as surely as with grep, and a question in plain words finds the answer that
@@ -58,8 +61,9 @@ Neither "passport" nor "backoff" was in the query or the file: the match is by m
   sfind says so and shows the three closest passages as such, exiting with 1 ("nothing found") for
   scripts; a small folder has too little for a match to stand out from, so there the closest passages
   are simply listed. In a very large folder (tens of thousands of passages) the best of many vaguely
-  similar passages can stand out by chance, so a search for something absent may still show a few. A passage with every word of the query is always shown. Copies of the same text
-  are shown once ("the same text in 24 other files").
+  similar passages can stand out by chance, so a search for something absent may still show a few.
+  A passage with every word of the query is always shown. Copies of the same text are shown once
+  ("the same text in 24 other files").
 - **Grep-like.** `-g "*.md"` for some files only, `-l` for file names only (of the best `-k`, 10 by
   default, and their copies), `--json` for scripts, exit code 1 when nothing is found and 2 on an error.
 
@@ -84,7 +88,8 @@ pip install "semantic-find @ git+https://github.com/zch6a/semantic-find"
 ```
 
 or `uv tool install git+https://github.com/zch6a/semantic-find` (or `pipx install ...`) to have the
-`sfind` command without touching other Python projects. Add `[pdf]` for PDF files.
+`sfind` command without touching other Python projects. For PDF files, install it with the `pdf`
+extra: `uv tool install "semantic-find[pdf] @ git+https://github.com/zch6a/semantic-find"`.
 
 ## Use
 
@@ -177,13 +182,18 @@ small. Take these numbers as a sanity check, not a benchmark.
 
 ## Status
 
-0.1, in development. Tested with synthetic notes and a tiny hand-made model (no download in the
-tests), by hand on the Python standard library (728 files and 12,254 passages indexed in 5 s on a
-laptop), on a generated folder of 3,060 mixed files (`eval/make_corpus.py`; indexed in 2.5 s once
-the files are in the disk cache) and on one of 6,060 longer files: 76,915 passages indexed in 49 s
-into a 195 MB index, searched in about 2 s (start-up included). On Windows, files written moments before are slow to read the first
-time while the antivirus scans them: 35 s for those 3,060 files. A search takes about 2 s with the multilingual model, 1 s of which is loading its 18 MB
-tokenizer, and under a second with the English ones.
+0.1.0, the first version. Windows, macOS and Linux, Python 3.10 and later. Tested with synthetic
+notes and a tiny hand-made model (no download in the tests; 84 tests, and a mutation runner that
+plants 47 bugs in turn and checks that a test catches each), and by hand, on a laptop:
+
+- the Python standard library: 728 files and 12,254 passages indexed in 5.5 s (with `potion-base-8M`);
+- a generated folder of 3,060 mixed files (`eval/make_corpus.py`): indexed in 2.5 s once the files are
+  in the disk cache; on Windows, files written moments before are slow to read the first time while
+  the antivirus scans them (35 s for those 3,060);
+- a generated folder of 6,060 longer files: 76,915 passages indexed in 49 s into a 195 MB index.
+
+A search, start-up included, takes about 2 s with the multilingual model (1 s of which is loading its
+18 MB tokenizer) and about 1 s with the English ones.
 
 ## Develop
 

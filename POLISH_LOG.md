@@ -225,3 +225,19 @@ Performance at scale, the first run of a fresh install, dependencies, and a muta
 After the new tests, all 47 are caught.
 
 84 tests, ruff clean.
+
+## Round 5
+
+The release check: every claim and number in both READMEs measured again on the current code, and an install from GitHub the way the README says.
+
+- **The opening examples were from an early version.** They had been made with the small English model before rounds 1–4 changed the scoring, and with today's defaults the output differs: the first search's score is 0.55, not 0.64, and in a folder of four short notes it also lists a code file weakly, since a folder that small gives no background for the stand-out test. The README now shows exactly what sfind 0.1.0 prints (the first with `-k 1`) and says why.
+- **Every number in the results table reproduced exactly** on the current code: 78% / 91% on the 100 tuning queries, 87% / 93% held out, 62% / 68% among 3,000 files, 50% with `potion-base-8M`.
+- **Timings, measured again:**
+  - the standard library indexes in 5.5 s (the README said 5);
+  - a search with an English model takes about 0.95 s (it said "under a second").
+
+  Both are now given as measured. "Later searches … start at once" was an overstatement, and is gone.
+- **Install**: `uv tool install "semantic-find[pdf] @ git+https://github.com/zch6a/semantic-find"` installs from GitHub with pypdf and searches straight away. "Add `[pdf]`" did not say where it goes, so the README now spells the command out.
+- Status: 0.1.0; long lines that had been run together were rewrapped. CONTRIBUTING says about 85 tests. CHANGELOG is dated, and the release is tagged `v0.1.0`.
+
+84 tests, mutation runner 47 of 47, ruff clean. semantic-find has been polished five times.

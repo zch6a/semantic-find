@@ -16,18 +16,18 @@
 ---
 
 ```console
-$ sfind "how long does getting a new travel document take" ~/notes
+$ sfind "how long does getting a new travel document take" ~/notes -k 1
 notes/travel.md:1
     Travel — Passport renewal: book an appointment at the post office, bring the old passport
     and two photos. It takes about six weeks.
-    (words: travel · meaning 0.64 · 1 more in this file)
+    (words: travel · meaning 0.55)
 ```
 
-查询里没有“passport”，文件里也没有“travel document”：这是按意思匹配到的。
+查询里没有“passport”，文件里也没有“travel document”：这是按意思匹配到的。（这是 sfind 0.1.0 用默认模型在一个只有四篇短笔记的文件夹里的实际输出；不加 `-k 1` 时还会列出一个代码文件作为弱匹配，因为文件夹太小，没有足够的背景让匹配“突出”。）
 
 ## 它能做什么
 
-- **不用配置。** `sfind 查询 [文件夹]` 第一次会先建索引再搜索；之后只重新读取改动过的文件，所以马上就能出结果。
+- **不用配置。** `sfind 查询 [文件夹]` 第一次会先建索引再搜索；之后只重新读取改动过的文件。
 - **关键词和意思一起用。** 每一段按意思（向量相似度）和它包含了查询里多少词（越少见的词分量越重）一起打分。像 `fetchWithRetry` 这样的确切名称和 grep 一样准，用大白话提的问题也能找到用词不同的答案。每条结果都会说明为什么匹配。[效果](#找得准不准)是实测的，不是估计的。
 - **中文以及各种语言。** 默认模型支持 101 种语言；关键词搜索把中文、日文、韩文按单字和相邻两个字切分，所以 `sfind "数据库连接池怎么配置"` 不需要词典也能用。用一种语言搜索，常常也能找到另一种语言写的文件（用“what tires for snow”能找到“记得把车的轮胎换成雪地胎”），只是不如同一种语言可靠。
 - **不只是代码，还有你的文档。** Markdown、纯文本、各种语言的代码、HTML、Word（.docx）、PowerPoint（.pptx）、Excel（.xlsx）、OpenDocument、EPUB、Jupyter 笔记本，以及 PDF（需 `pip install "semantic-find[pdf]"`）。旧编码的文件（GB18030、Big5、Shift-JIS、EUC-KR、Windows-1252）也能识别并读取。损坏的文件会被跳过，不会影响整个文件夹。
@@ -49,7 +49,7 @@ notes/travel.md:1
 pip install "semantic-find @ git+https://github.com/zch6a/semantic-find"
 ```
 
-或者用 `uv tool install git+https://github.com/zch6a/semantic-find`（或 `pipx install ...`），只安装 `sfind` 命令、不影响其他 Python 项目。要搜索 PDF 请加上 `[pdf]`。
+或者用 `uv tool install git+https://github.com/zch6a/semantic-find`（或 `pipx install ...`），只安装 `sfind` 命令、不影响其他 Python 项目。要搜索 PDF，请带上 `pdf` 附加依赖安装：`uv tool install "semantic-find[pdf] @ git+https://github.com/zch6a/semantic-find"`。
 
 ## 使用
 
@@ -106,7 +106,7 @@ sfind models                                 # 有哪些模型、哪些已下载
 
 ## 状态
 
-0.1，开发中。用合成的笔记和一个手工构造的小模型测试（测试不需要下载任何东西），并手动试过 Python 标准库（728 个文件、12254 个段落，在笔记本上 5 秒建完索引）、一个生成的 3060 个混杂文件的文件夹（`eval/make_corpus.py`；文件已在磁盘缓存里时 2.5 秒建完索引），以及一个 6060 个较长文件的文件夹：76915 个段落 49 秒建完索引，索引文件 195 MB，每次搜索约 2 秒（含启动）。在 Windows 上，刚写入的文件第一次读取会很慢，因为杀毒软件在扫描：这 3060 个文件要 35 秒。用多语言模型每次搜索约 2 秒，其中 1 秒是加载它 18 MB 的分词器；用英文模型不到 1 秒。
+0.1.0，第一个版本。支持 Windows、macOS 和 Linux，Python 3.10 及以上。用合成的笔记和一个手工构造的小模型测试（测试不需要下载任何东西；84 个测试，另有变异测试脚本依次埋入 47 个错误，确认每个都会被测试发现），并在笔记本上手动试过 Python 标准库（728 个文件、12254 个段落，用 `potion-base-8M` 5.5 秒建完索引）、一个生成的 3060 个混杂文件的文件夹（`eval/make_corpus.py`；文件已在磁盘缓存里时 2.5 秒建完索引），以及一个 6060 个较长文件的文件夹：76915 个段落 49 秒建完索引，索引文件 195 MB，每次搜索约 2 秒（含启动）。在 Windows 上，刚写入的文件第一次读取会很慢，因为杀毒软件在扫描：这 3060 个文件要 35 秒。每次搜索（含启动）用多语言模型约 2 秒，其中 1 秒是加载它 18 MB 的分词器；用英文模型约 1 秒。
 
 ## 开发
 
