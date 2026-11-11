@@ -398,6 +398,9 @@ def _pdf(data: bytes) -> str | None:
         from pypdf import PdfReader
     except ImportError:
         return None  # reading PDF needs the optional extra: pip install "semantic-find[pdf]"
+    import logging
+
+    logging.getLogger("pypdf").setLevel(logging.ERROR)  # its warnings about damaged files are not for the user
     try:
         reader = PdfReader(io.BytesIO(data))
         return "\f".join((page.extract_text() or "") for page in reader.pages)

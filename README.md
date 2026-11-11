@@ -52,8 +52,11 @@ Neither "passport" nor "backoff" was in the query or the file: the match is by m
 - **Small and fast.** The model is a static embedding model ([Model2Vec](https://github.com/MinishLab/model2vec)):
   no neural network runs, so there is no PyTorch and no GPU. The only dependencies are numpy and
   Hugging Face's `tokenizers`.
+- **Only what matches.** A search for something that is not in the folder finds nothing, rather than
+  the least bad passages. Weak matches after a strong one are left out, and copies of the same text are
+  shown once ("the same text in 24 other files").
 - **Grep-like.** `-g "*.md"` for some files only, `-l` for file names only (of the best `-k`, 10 by
-  default), `--json` for scripts, exit code 1 when nothing is found and 2 on an error.
+  default, and their copies), `--json` for scripts, exit code 1 when nothing is found and 2 on an error.
 
 ## Privacy
 
@@ -122,36 +125,48 @@ is.
    pairs.
 4. **Meaning**: each passage, with its file name and heading, becomes a vector: the average of its
    tokens' vectors in the static model, stored as float16.
-5. **Search**: each candidate scores its similarity to the query (relative to the best one) plus half
-   the share of the query's words it contains, rarer words weighing more. Reciprocal-rank fusion, the
-   usual way to combine two rankings, was tried first and measured worse: it let a passage sharing
-   one word of four outrank the one that meant what was asked. A passage found only by meaning must be
-   at least half as close as the best one, so a search for something that is not there finds nothing
-   rather than noise. The best passage of each file is shown.
+5. **Search**: each candidate scores its similarity to the query (relative to the best one) plus 0.15
+   times the share of the query's words it contains, rarer words weighing more. Reciprocal-rank
+   fusion, the usual way to combine two rankings, was tried first and measured worse: it let a passage
+   sharing one word of four outrank the one that meant what was asked.
+6. **What is shown**: a passage found only by meaning must be at least half as close as the best one,
+   and in a folder of 500 passages or more it must stand out from the rest: at least three standard
+   deviations above the folder's mean similarity to the query. Measured on 3,000 files, right
+   answers stood 3.6 to 7.9 deviations out, and the best matches for subjects absent from the folder
+   at most 2.8. Results scoring under 60% of the best are dropped, the best passage of each file is
+   shown, and copies of a passage are shown once.
 
 
 ## How well it finds things
 
-Measured with `eval/evaluate.py` on a small evaluation set (`eval/data.py`): 29 synthetic notes,
-documents and code files in English and Chinese, some of them near-misses for others, and 45 queries
-with a known answer. "Top 1" is how often the right file comes first.
+Measured with `eval/evaluate.py` on `eval/data.py`: 53 synthetic notes, documents and code files in
+English and Chinese, some of them near-misses for others, and 100 queries with a known answer. 18
+use the answer's own words, 52 say it in other words (sharing no content word with it), and 30 are
+in the other language. "Top 1" is how often the right file comes first.
 
-| Mode, default model | same words, top 1 | other words, top 1 | other language, top 1 | all, top 1 | all, top 5 |
+| Default model | exact words, top 1 | other words, top 1 | other language, top 1 | all, top 1 | all, top 5 |
 |---|---|---|---|---|---|
-| keyword (`--mode keyword`) | 100% | 82% | 0% | 69% | 69% |
-| meaning (`--mode meaning`) | 100% | 86% | 67% | 84% | 96% |
-| **hybrid** (the default) | 100% | **93%** | 44% | 84% | 96% |
+| keyword (`--mode keyword`) | 100% | 44% | 0% | 41% | 45% |
+| meaning (`--mode meaning`) | 89% | 71% | 70% | 74% | 91% |
+| **hybrid** (the default) | **100%** | **73%** | 67% | **76%** | **91%** |
+| hybrid, the documents among 3,000 other files (`--haystack 3000`) | 100% | 67% | 37% | 64% | 75% |
 
-Within one language the hybrid is best; across languages, searching by meaning alone does better
-(`--mode meaning`). The set is small and its "other words" queries still share some words with their
-answers, so take these as a sanity check, not a benchmark. The English-only models find nothing across
-languages, as expected.
+The last row is closer to a real folder: the same documents hidden among 3,000 generated notes,
+Office files, PDFs and code on similar subjects. With the English-only `potion-base-8M`, hybrid search
+finds 52% first (53% among the 3,000), and nothing across languages, as expected.
+
+What this means in use: exact names and words are found as with grep; a question in other words
+finds the right file first about three times in four in a small folder, and two in three in a large
+one; across languages it often works but is the weak point of a static model. The set is small, so
+take it as a sanity check, not a benchmark.
 
 ## Status
 
 0.1, in development. Tested with synthetic notes and a tiny hand-made model (no download in the
-tests), and by hand on the Python standard library: 728 files and 12,254 passages are indexed in 5 s
-on a laptop. A search takes about 2 s with the multilingual model, 1 s of which is loading its 18 MB
+tests), by hand on the Python standard library (728 files and 12,254 passages indexed in 5 s on a
+laptop) and on a generated folder of 3,060 mixed files (`eval/make_corpus.py`; indexed in 2.5 s once
+the files are in the disk cache). On Windows, files written moments before are slow to read the first
+time while the antivirus scans them: 35 s for those 3,060 files. A search takes about 2 s with the multilingual model, 1 s of which is loading its 18 MB
 tokenizer, and under a second with the English ones.
 
 ## Develop

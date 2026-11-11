@@ -93,3 +93,34 @@ Three things this round: an independent review of the code (with every finding r
 **Docs**: the README has a measured-results table in both languages, the scoring described as it is, git and concurrency behaviour, the pinned downloads, and timings that are now measured. New CONTRIBUTING.md and CHANGELOG.md.
 
 60 tests, ruff clean (CI now lints `eval/` too).
+
+## Round 2
+
+Real use. `eval/make_corpus.py` (new) writes a large, messy synthetic folder: 3,060 files of notes, GB18030 text, .docx, PDFs and code, in English and Chinese. It has 50 copied notes, clutter that should be skipped, damaged and empty files, a note twelve folders deep, and five planted documents with known content. Every command and option was tried on it with the default model, the way a new user would.
+
+**What real use showed, and what changed**
+- **Weak matches after a strong one**: "when should the timing belt be checked" found the service record first, then two unrelated notes. A result must now score at least 60% of the best one (`SCORE_FLOOR`). On eval/ this costs nothing in hit@5 and cuts results per query from 4.3 to 2.3.
+- **Searches for what is not there returned junk.** "bcrypt", "xylophone lessons" and "量子计算" are absent from the folder, yet each listed five unrelated notes at similarity 0.25–0.3, because relative floors always keep something. Measured on the folder, right answers stand 3.6 to 7.9 standard deviations above the mean similarity of all passages to the query, and noise at most 2.8. A passage found only by meaning must now stand out by 3 deviations. All three searches now say "nothing found", and the planted answers come back alone.
+
+  In a small folder there is no background to stand out from: on eval/ alone the test cost 18 points of hit@5. So it applies only from 500 passages. A limit, noted for later: the largest of n noise values grows like √(2 ln n), so very large folders may need a higher threshold. On 4,000 passages the noise stayed at 2.8.
+- **Copies**: "backup every night" listed three identical copied notes. Exact copies of a passage are now shown once, with "the same text in 24 other files". `-l` still lists them all, and `--json` has them in `same`.
+- **`-l` printed absolute paths while normal output was relative.** Both are now relative to the current folder, as grep prints them.
+- **Snippets were cut at 240 characters**, so Chinese snippets were twice as wide on screen. They are now cut by display width.
+- **pypdf's own warnings** ("EOF marker not found") leaked into the output; they are silenced. Also: "1 passages embedded" is now singular.
+- **First index of the folder: 37.5 s.** The cause is not sfind: plain reads of 3,061 freshly written files took 35.2 s the first time and 0.37 s the second (the antivirus scans new files). Warm, the folder indexes in 2.5 s with the default model, which embeds 2,000 passages in 0.1 s. The README mentions it.
+- **Fine as it was:**
+  - deleted and edited files are picked up on the next search (0.3 s);
+  - searching from inside the folder with no path;
+  - cross-language finds ("how often do I vaccinate the cat" → the Chinese note about the cat);
+  - `-g`, `-a`, `status`.
+
+**The evaluation set, made honest.** Keyword search alone answered 82% of the old "other words" queries, because they shared words with their answers. There are now 23 more documents and 55 more queries written to share no content word with the answer (100 queries in all: 18 exact, 52 other words, 30 other language). Keyword search now gets 44% of the other-words queries. `--haystack N` hides the documents among N generated files.
+
+**That exposed a regression: hybrid scored below meaning alone** (71% top 1 against 74%), losing on cross-language queries. The keyword weight was swept from 0 to 0.5 on three models, and a coverage exponent was tried and made no difference. At 0.15 the default model reaches 76% top 1 and 91% top 5 (meaning alone: 74% and 91%), with exact names still at 100%. Below 0.15 the default model starts missing exact names ("bcrypt", "TokenBucket"). With the English models, 0.15 is within one or two queries of their best. The score floor was checked again at the new weight; 0.6 still costs nothing.
+
+| default model, hybrid | top 1 | top 5 | other words, top 1 | other language, top 1 |
+|---|---|---|---|---|
+| eval/ alone | 76% | 91% | 73% | 67% |
+| among 3,000 other files | 64% | 75% | 67% | 37% |
+
+66 tests (new: `tests/test_results.py` for copies, the score floor, the stand-out test, singular and plural, and the corpus maker), ruff clean.

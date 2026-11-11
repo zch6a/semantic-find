@@ -3,6 +3,7 @@
     python eval/evaluate.py                       # the default model (it must be downloaded)
     python eval/evaluate.py --model potion-base-8M
     python eval/evaluate.py --model ollama:bge-m3
+    python eval/evaluate.py --haystack 3000       # the documents hidden among 3,000 generated files
 
 For every query it reports whether the right file is first (hit@1), among the first five (hit@5), and the
 mean reciprocal rank (MRR: 1 for first, 1/2 for second, ...), for keyword search, search by meaning, and
@@ -28,10 +29,17 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=os.environ.get("SFIND_MODEL", DEFAULT_MODEL))
     ap.add_argument("--show", action="store_true", help="print every query that misses its answer in the hybrid mode")
+    ap.add_argument("--haystack", type=int, default=0, metavar="N",
+                    help="hide the documents among N generated filler files (eval/make_corpus.py), as in a real folder")
     args = ap.parse_args()
     model = load(args.model)
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "corpus"
+        if args.haystack:
+            import subprocess
+
+            subprocess.run([sys.executable, str(Path(__file__).with_name("make_corpus.py")), str(root / "filler"),
+                            "--files", str(args.haystack), "--seed", "7"], check=True, capture_output=True)
         for rel, text in DOCS.items():
             p = root / rel
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -51,7 +59,7 @@ def main() -> int:
                 if mode == "hybrid" and rank != 1:
                     misses.append((query, answer, kind, rank, paths[:3]))
         idx.close()
-    print(f"model: {args.model}; {len(DOCS)} documents, {len(QUERIES)} queries "
+    print(f"model: {args.model}; {len(DOCS)} documents" + (f" among {args.haystack} filler files" if args.haystack else "") + f", {len(QUERIES)} queries "
           f"({', '.join(f'{sum(1 for q in QUERIES if q[2] == k)} {k}' for k in kinds)})\n")
     print(f"{'':10}" + "".join(f"{k:>24}" for k in (*kinds, "all")))
     print(f"{'':10}" + "".join(f"{'hit@1  hit@5   MRR':>24}" for _ in (*kinds, "all")))

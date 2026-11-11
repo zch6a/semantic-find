@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import sys
+import unicodedata
 from pathlib import Path
 
 from . import __version__
@@ -94,7 +95,7 @@ def _update(idx: Index, model, name: str, quiet: bool) -> None:
         if st.removed:
             parts.append(f"{st.removed} gone")
         if st.embedded:
-            parts.append(f"{st.embedded} passages embedded")
+            parts.append(f"{st.embedded} passage{'s' if st.embedded != 1 else ''} embedded")
         _err(f"index of {idx.root} updated: {', '.join(parts)} in {st.seconds:.1f} s")
 
 
@@ -119,8 +120,12 @@ def snippet(text: str, words: list[str], width: int = 240, heading: str = "") ->
     if start:
         space = flat.find(" ", start)
         start = space + 1 if 0 <= space < first else start
-    out = flat[start:start + width]
-    return ("…" if start else "") + out + ("…" if start + width < len(flat) else "")
+    # Cut by width on screen, not by characters: a Chinese character takes two columns.
+    end, cols = start, 0
+    while end < len(flat) and cols < width:
+        cols += 2 if unicodedata.east_asian_width(flat[end]) in ("W", "F") else 1
+        end += 1
+    return ("…" if start else "") + flat[start:end] + ("…" if end < len(flat) else "")
 
 
 def highlight(text: str, words: list[str]) -> str:
@@ -130,13 +135,18 @@ def highlight(text: str, words: list[str]) -> str:
     return pattern.sub(lambda m: f"\033[1;33m{m.group(0)}\033[0m", text)
 
 
-def _where(root: Path, hit: Hit) -> str:
-    full = root / hit.path if root.is_dir() else root
+def _shown(root: Path, rel: str) -> str:
+    """A path as it is shown: relative to the current folder when that is shorter, as grep shows it."""
+    full = root / rel if root.is_dir() else root
     try:
         shown = os.path.relpath(full)
-        shown = shown if not shown.startswith("..") or len(shown) < len(str(full)) else str(full)
+        return shown if not shown.startswith("..") or len(shown) < len(str(full)) else str(full)
     except ValueError:  # another drive on Windows
-        shown = str(full)
+        return str(full)
+
+
+def _where(root: Path, hit: Hit) -> str:
+    shown = _shown(root, hit.path)
     return f"{shown} (page {hit.page})" if hit.page else f"{shown}:{hit.line}"
 
 
@@ -148,6 +158,9 @@ def why(hit: Hit) -> str:
         parts.append(f"meaning {hit.similarity:.2f}")
     if hit.more:
         parts.append(f"{hit.more} more in this file")
+    if hit.same:
+        n = len(hit.same)
+        parts.append(f"the same text in {n} other file{'s' if n != 1 else ''}" + (": " + ", ".join(hit.same) if n <= 2 else ""))
     return " · ".join(parts)
 
 
@@ -186,12 +199,13 @@ def cmd_search(args) -> int:
     if args.json:
         print(json.dumps([{"path": str(root / h.path if root.is_dir() else root), "line": h.line, "page": h.page, "text": h.text,
                            "score": round(h.score, 6), "words": h.words,
-                           "similarity": None if h.similarity is None else round(h.similarity, 4), "more": h.more}
+                           "similarity": None if h.similarity is None else round(h.similarity, 4), "more": h.more,
+                           "same": [str(root / p) for p in h.same]}
                           for root, h in results], ensure_ascii=False, indent=2))
         return 0 if results else 1
-    if args.files:
-        for root, h in dict(((r / h.path).as_posix(), (r, h)) for r, h in results).values():
-            print(str(root / h.path) if root.is_dir() else str(root))
+    if args.files:  # each matching file once, copies of a passage included
+        for shown in dict.fromkeys(_shown(root, rel) for root, h in results for rel in (h.path, *h.same)):
+            print(shown)
         return 0 if results else 1
     if not results:
         _err("nothing found")

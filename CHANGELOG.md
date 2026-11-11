@@ -14,4 +14,7 @@ First version.
 - Reads text, code, Markdown, HTML, Word, PowerPoint, Excel, OpenDocument, EPUB, notebooks and (with
   the `pdf` extra) PDF, in UTF-8, UTF-16 and common legacy encodings.
 - In git repositories, follows what git tracks and ignores.
+- Shows only what matches: weak matches after a strong one are dropped, a match by meaning must stand out
+  from the rest of a large folder, so a search for something absent finds nothing; copies of a passage are
+  shown once.
 - `sfind index`, `status`, `forget`, `models`; `-g`, `-l`, `--json`, `--mode`.

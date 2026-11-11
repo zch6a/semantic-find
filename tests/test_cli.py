@@ -73,3 +73,10 @@ def test_models_lists_what_is_there(capsys):
 def test_snippets_show_the_heading_as_a_heading(text, words, expect):
     heading = "Bread" if "Bread" in text else ""
     assert cli.snippet(text, words, heading=heading) == expect
+
+
+def test_snippets_are_cut_by_width_on_screen():
+    zh = "今天走了七公里。" * 60
+    en = "walked seven km. " * 60
+    assert len(cli.snippet(zh, [], width=40)) == 21  # 20 wide characters and the ellipsis
+    assert len(cli.snippet(en, [], width=40)) == 41

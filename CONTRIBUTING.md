@@ -32,6 +32,8 @@ not end up in your real data folder.
 ```bash
 sfind models download                      # once
 python eval/evaluate.py --show             # hit@1, hit@5 and MRR per mode and kind of query
+python eval/evaluate.py --haystack 3000    # the same, with the documents hidden among 3,000 generated files
+python eval/make_corpus.py /tmp/big        # a large messy folder to try sfind on by hand
 ```
 
 `eval/data.py` is a small synthetic set in English and Chinese. If you change how search scores

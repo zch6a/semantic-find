@@ -6,12 +6,12 @@ and each passage's vector as float16.
 
 Searching scores each candidate passage as
 
-    similarity / best similarity  +  KEYWORD_WEIGHT × the share of the query's words it contains
+    similarity / best similarity  +  KEYWORD_WEIGHT (0.15) × the share of the query's words it contains
 
 (words weighted by rarity). Reciprocal-rank fusion, the usual way to merge two rankings, was tried first
 and measured on eval/: it lets a passage that shares one word of four with the query outrank the one
 that means what was asked, and with the default model it found the right file first for only 22% of
-queries across languages, against 44% this way, with no loss within one language.
+queries across languages. Score fusion was then tuned on 100 queries (see KEYWORD_WEIGHT).
 """
 
 from __future__ import annotations
@@ -40,9 +40,23 @@ CANDIDATES = 300  # from each ranking, before fusing
 # similarity always has a "best", so without a floor every search would fill its list with noise.
 RELATIVE_FLOOR = 0.5
 MIN_SIMILARITY = 0.1  # and never below this, however weak the best one is
+# ... and it must stand out from the folder: at least this many standard deviations above the mean
+# similarity of all passages to the query. Measured on a 3,000-file folder: right answers stood 3.6 to
+# 7.9 deviations out, the noise after them, and every match for a word that was not there at all
+# ("bcrypt", "xylophone lessons", "量子计算"), at 2.8 or less. Chosen on eval/ with --haystack 3000. In a small
+# folder there is no background to stand out from (eval/ alone lost 18 points of hit@5 with it), so the
+# test applies only from STANDOUT_FROM passages.
+MIN_STANDOUT = 3.0
+STANDOUT_FROM = 500
 # How much a passage containing all of the query's words gains over one that only means the same.
-# Chosen on eval/ (0.2 to 1.5 tried): lower helps queries across languages and costs ones within one.
-KEYWORD_WEIGHT = 0.5
+# Chosen on eval/ (100 queries, three models, 0 to 1.5 tried): higher loses queries across languages,
+# lower loses exact names ("bcrypt", "TokenBucket") with the default model.
+KEYWORD_WEIGHT = 0.15
+# A result is shown only if it scores at least this share of the best result. When the best one matches
+# by both words and meaning, a passage that only means something vaguely similar is noise (measured on
+# a 3,000-file folder: "when should the timing belt be checked" listed two unrelated notes after the
+# right one). Chosen on eval/.
+SCORE_FLOOR = 0.6
 
 
 COMMIT_EVERY = 200  # files: an interrupted first index keeps what it has done
@@ -108,6 +122,7 @@ class Hit:
     similarity: float | None = None  # cosine similarity of meaning, when there are vectors
     more: int = 0  # other matching passages in the same file
     context: str = ""  # the heading the passage is under
+    same: list[str] = field(default_factory=list)  # other files with exactly the same passage
 
 
 class Index:
@@ -326,6 +341,8 @@ class Index:
                                "search without --no-update to embed it again, or pass --model " + str(self.meta("model")))
         sims = mat.astype(np.float32) @ vector.astype(np.float32)
         top = np.argsort(-sims)[:limit]
+        self.last_spread = (float(sims.mean()), float(sims.std()))  # for the stand-out test in search
+        self.last_count = len(sims)
         return [(int(ids[i]), float(sims[i])) for i in top]
 
     def search(self, query: str, model=None, *, k: int = 10, mode: str = "hybrid", glob: str | None = None,
@@ -352,9 +369,13 @@ class Index:
                 similarity.update(self.similarities(query_vector, [p for p in kw if p not in similarity]))
             for rank, pid in enumerate(kw):  # BM25's order breaks ties between passages that cover as much
                 score[pid] = KEYWORD_WEIGHT * cover.get(pid, 0.0) * (1 - rank / (10 * len(kw))) + max(similarity.get(pid, 0.0), 0.0) / best
+            mean, spread = self.last_spread
+            standout = mean + MIN_STANDOUT * max(spread, 1e-6) if self.last_count >= STANDOUT_FROM else -1.0
             for pid, sim in sem:
-                if pid not in score and sim >= floor:
+                if pid not in score and sim >= floor and sim >= standout:
                     score[pid] = sim / best
+            top = max(score.values(), default=0.0)
+            score = {pid: s for pid, s in score.items() if s >= SCORE_FLOOR * top}
         else:  # keywords alone: BM25's order
             for rank, pid in enumerate(kw):
                 score[pid] = 1.0 / (rank + 1)
@@ -371,6 +392,7 @@ class Index:
         q_terms = set(query_terms(query))
         hits: list[Hit] = []
         by_file: dict[str, Hit] = {}
+        by_text: dict[str, Hit] = {}
         for pid in order:
             if pid not in rows:
                 continue
@@ -380,10 +402,17 @@ class Index:
             if per_file and path in by_file:
                 by_file[path].more += 1
                 continue
+            same_text = " ".join(text.split())
+            if same_text in by_text:  # a copy of a passage already listed: said once, with where the copies are
+                if path not in by_text[same_text].same and path != by_text[same_text].path:
+                    by_text[same_text].same.append(path)
+                by_file.setdefault(path, by_text[same_text])
+                continue
             found = join_pairs(query, [t for t in dict.fromkeys(terms(text)) if t in q_terms])
             hit = Hit(path, line, page, text, score[pid], found, similarity.get(pid), context=context or "")
             hits.append(hit)
             by_file[path] = hit
+            by_text[same_text] = hit
             if len(hits) >= k and not per_file:
                 break
         return hits[:k]
