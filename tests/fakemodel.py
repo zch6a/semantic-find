@@ -34,7 +34,7 @@ def make_model(folder: Path, *, weights: bool = False, mapping: bool = False, dt
 
     folder.mkdir(parents=True, exist_ok=True)
     vocab = {"[UNK]": 0}
-    vectors = [np.zeros(len(TOPICS) + 4)]
+    vectors = [np.full(len(TOPICS) + 4, 0.3)]  # [UNK]: not zero, as in real models, so that keeping it would show
     rng = np.random.default_rng(7)
     for t, (_, words) in enumerate(TOPICS.items()):
         for w in words:

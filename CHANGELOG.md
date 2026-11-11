@@ -18,3 +18,5 @@ First version.
   from the rest of a large folder, so a search for something absent finds nothing; copies of a passage are
   shown once.
 - `sfind index`, `status`, `forget`, `models`; `-g`, `-l`, `--json`, `--mode`.
+- For contributors: `eval/` (an evaluation set with held-out queries, a corpus maker, the stand-out study) and
+  `scripts/mutate.py`.

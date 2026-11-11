@@ -83,6 +83,7 @@ def main() -> int:
     ap.add_argument("out")
     ap.add_argument("--files", type=int, default=3000)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--long", type=int, default=1, metavar="N", help="files N times longer (for many passages without many files)")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     root = Path(args.out)
@@ -94,7 +95,7 @@ def main() -> int:
         zh = rng.random() < 0.4
         folder = rng.choice([f for f in folders if (f.startswith("笔记") or f.startswith("archive")) == zh or f.startswith("archive")])
         topic, text = paragraph(rng, zh)
-        body = "\n\n".join([text] + [paragraph(rng, zh)[1] for _ in range(rng.randint(0, 8))])
+        body = "\n\n".join([text] + [paragraph(rng, zh)[1] for _ in range(rng.randint(0, 8) * args.long + (args.long - 1) * 4)])
         kind = rng.random()
         path = root / folder / f"{topic}-{i:05d}"
         path.parent.mkdir(parents=True, exist_ok=True)

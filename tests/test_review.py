@@ -191,9 +191,9 @@ def test_ollama_listening_everywhere_is_reached_here():
 def test_one_chinese_character_is_found(tmp_path, capsys):
     d = tmp_path / "docs"
     d.mkdir()
-    (d / "车.md").write_text("我的车坏了，要去修。", encoding="utf-8")
+    (d / "note.md").write_text("我的车坏了，要去修。", encoding="utf-8")  # (not 车.md: the file name would match)
     code, out, _ = run(capsys, "车", str(d), "--mode", "keyword")
-    assert code == 0 and "车.md" in out
+    assert code == 0 and "note.md" in out
 
 
 def test_office_tabs_breaks_text_boxes_and_inline_cells(tmp_path):

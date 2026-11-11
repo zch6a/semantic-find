@@ -10,7 +10,8 @@ synthetic files) where a search finds the wrong thing, and what you expected it 
 git clone https://github.com/zch6a/semantic-find && cd semantic-find
 uv venv && uv pip install -e ".[pdf]" pytest ruff
 uv run pytest                 # about 60 tests; no model download, no network
-uv run ruff check src tests eval
+uv run ruff check src tests eval scripts
+uv run python scripts/mutate.py   # plants each bug in its list in turn; every one must make a test fail
 ```
 
 Set `SEMANTIC_FIND_HOME` to a temporary folder while you try things, so that test indexes and models do

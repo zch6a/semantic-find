@@ -128,3 +128,72 @@ def test_bad_k_and_meaning_without_vectors_are_explained(tmp_path, capsys):
     m = make_model(tmp_path / "m")
     code, _, err = run(capsys, "passport", str(d), "--mode", "meaning", "--model", str(m), "--no-update")
     assert code == 2 and "no vectors yet" in err
+
+
+def test_weak_matches_go_when_there_is_a_strong_one(tmp_path, model_path, monkeypatch):
+    d = folder(tmp_path, "d", {"a.md": "passport renewal", "b.md": "visa trip flight travel"})  # b: close in meaning, no words
+    model = StaticModel(model_path)
+    idx = ix.Index(d)
+    idx.update(model, "fake")
+    monkeypatch.setattr(ix, "STANDOUT_FROM", 1)
+    monkeypatch.setattr(ix, "MIN_STANDOUT", 100.0)  # nothing found by meaning alone stands out
+    assert [h.path for h in idx.search("passport renewal", model)] == ["a.md"], "a.md has the words: b.md is weak, and goes"
+    idx.close()
+
+
+def test_a_meaning_match_far_below_the_best_is_not_shown(tmp_path, model_path, monkeypatch):
+    d = folder(tmp_path, "d", {"a.md": "visa trip flight travel", "b.md": "visa bread oven dough flour knead"})
+    model = StaticModel(model_path)
+    idx = ix.Index(d)
+    idx.update(model, "fake")
+    monkeypatch.setattr(ix, "SCORE_FLOOR", 0.0)  # the relative floor on similarity alone
+    hits = idx.search("flight trip", model, mode="meaning")
+    assert [h.path for h in hits] == ["a.md"], [(h.path, round(h.similarity, 2)) for h in hits]
+    idx.close()
+
+
+def test_a_passage_repeated_in_one_file_is_not_its_own_copy(tmp_path, model_path):
+    long_x = "passport renewal embassy photos " * 30
+    d = folder(tmp_path, "d", {"a.md": long_x + "\n\n" + long_x, "b.md": long_x})
+    model = StaticModel(model_path)
+    idx = ix.Index(d)
+    idx.update(model, "fake")
+    hits = idx.search("passport renewal", model, per_file=False)
+    first = hits[0]
+    assert first.path not in first.same and first.same.count("b.md") <= 1
+    idx.close()
+
+
+def test_a_file_whose_reader_fails_in_any_way_is_skipped(tmp_path, monkeypatch, capsys):
+    d = folder(tmp_path, "d", {"good.md": "passport", "odd.md": "passport too"})
+    real = ix.read_text
+
+    def flaky(path):
+        if path.name == "odd.md":
+            raise ValueError("a reader's own error, not an OSError")
+        return real(path)
+
+    monkeypatch.setattr(ix, "read_text", flaky)
+    code, out, _ = run(capsys, "passport", str(d), "--mode", "keyword", "-q")
+    assert code == 0 and "good.md" in out
+
+
+def test_g_filters_before_the_meaning_candidates_are_cut(tmp_path, model_path, monkeypatch):
+    files = {f"n{i}.txt": "visa trip flight travel" for i in range(8)}
+    files["plan.md"] = "visa trip"
+    d = folder(tmp_path, "d", files)
+    model = StaticModel(model_path)
+    idx = ix.Index(d)
+    idx.update(model, "fake")
+    monkeypatch.setattr(ix, "CANDIDATES", 3)
+    assert [h.path for h in idx.search("flight travel", model, mode="meaning", glob="*.md")] == ["plan.md"]
+    idx.close()
+
+
+def test_chinese_coverage_is_counted_by_characters(tmp_path):
+    d = folder(tmp_path, "d", {"db.md": "数据库配置要写在启动脚本里"})
+    idx = ix.Index(d)
+    idx.update(None)
+    pid = idx.keyword("怎么配置数据库")[0]
+    assert idx.coverage("怎么配置数据库", [pid])[pid] == pytest.approx(1.0), "every character but the filler is there"
+    idx.close()

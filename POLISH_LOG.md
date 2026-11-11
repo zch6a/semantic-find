@@ -178,3 +178,50 @@ Among 3,000 files, top 1 went from 64% to 66% and top 5 from 75% to 77% (countin
 A known trade-off from the coverage fix: an absent word weighs the most even when it is a common verb. "how to recover from jet lag" now ranks the jet-lag note 6th, because "recover" occurs nowhere and the note matches "jet lag" only through its file name. Without word frequencies from outside the folder, that case cannot be told from "xylophone lessons".
 
 77 tests, ruff clean.
+
+## Round 4
+
+Performance at scale, the first run of a fresh install, dependencies, and a mutation runner.
+
+**At scale.** `eval/make_corpus.py --long N` (new) writes longer files, which gives many passages from few files and keeps the antivirus out of the measurement. 6,060 files with 76,915 passages:
+
+| | before | after |
+|---|---|---|
+| index file | 337 MB | 195 MB |
+| indexing (files in the disk cache) | 61 s | 49 s |
+| a search, start-up included | 3.1–4.3 s | about 2 s |
+
+- **Space**: FTS5 kept its own copy of every passage's terms, 142 MB of the 337. sfind only read that copy to compute coverage, which is now worked out from the passage text (≤ 300 candidates). FTS5 is now contentless with `contentless_delete=1` (SQLite 3.43+; older SQLite keeps the copy). A dropped table's pages stay in the file until a VACUUM, so the schema rebuild runs one, and new indexes use incremental auto-vacuum so that deleted files give their space back.
+- **Indexing**:
+  - tokenizing took 26.8 s of 65 s, computing character offsets for every token; `encode_batch_fast` (tokenizers ≥ 0.20, what Model2Vec itself uses) skips them, and the vectors are still identical to Model2Vec's;
+  - one INSERT per passage took 9 s; the inserts are now batched per file, with the ids given up front.
+- **Search**:
+  - pathlib's `relative_to` took 0.6 s on 6,000 paths, and now uses string slicing;
+  - two full scans for "passages without a vector" took 0.55 s, and now use a partial index;
+  - rebuilding the vector matrix from 77,000 rows took 0.4 s; it is now a memory-mapped `.npy` file next to the index, rewritten only when the vectors change.
+
+  What is left is mostly the multilingual tokenizer's 18 MB JSON (0.9 s).
+- **A limit, measured and documented**: at 77,000 passages, "xylophone lessons" showed five unrelated passages as matches. The best of that many vaguely similar passages clears 3 deviations by chance, as eval/standout.py predicted. A threshold that grows with the folder would mark most right answers weak at that size (their median is 3.75), so it stays, and the README says so.
+
+**A fresh install, as a new user.** The wheel was built, installed into an empty venv, and every first command tried with no model.
+- **The README said the only dependencies were numpy and tokenizers.** The install pulled 21 packages: tokenizers 0.23 depends on huggingface_hub, which brings httpx, anyio, hf-xet and more. Replacing tokenizers with a pure-Python SentencePiece would make indexing far too slow, so the README now says what is installed.
+- pip-audit finds no known vulnerabilities in those 20 dependencies.
+- **Messages**:
+  - `--mode meaning` without the model said "searching by keywords only", then exited 2; it now says that searching by meaning needs the model, and how to get it;
+  - `sfind index` no longer says "searching";
+  - "1 files, 1 passages" is now singular.
+
+**Mutation runner** (`scripts/mutate.py`, after kanjian's; CI lints `scripts/`). It has 47 mutants, covering the scoring rules, grouping and copies, index upkeep, terms, the CLI and downloads. The first run caught 37 of 47. The 10 survivors:
+- The rules that hide weak matches when a strong one exists, and the relative similarity floor: no test had a weak match scoring high enough to survive the score floor. Both are now tested.
+- A passage repeated in one file listed its own file as a copy.
+- A reader failing with a non-OS error: no test raised one, because pypdf's errors are caught inside the PDF reader.
+- `-g` in meaning mode. Its test monkeypatched `CANDIDATES`, but `semantic()` and `keyword()` had it as a default argument, which Python binds when the function is defined, so the test never tested anything. The default is now read at call time.
+- Single CJK characters: the test file was named 车.md, so "车" matched through the file name.
+- Chinese coverage by characters: never checked.
+- Dropping unknown tokens: the fake model's unknown vector was zero, so including it changed nothing. It is now non-zero, as in real models.
+- The merge-conflict guard in `index.py` was redundant: `files.py` already removes duplicates. It was removed, and the mutant now targets `files.py`.
+- One mutant had the wrong indent and matched nothing.
+
+After the new tests, all 47 are caught.
+
+84 tests, ruff clean.

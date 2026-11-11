@@ -170,3 +170,9 @@ def test_the_tokenizer_facts_are_worked_out_once(model_path):
     st = (model_path / "tokenizer.json").stat()
     os.utime(model_path / "tokenizer.json", ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
     assert StaticModel(model_path).median_token_length != 99, "a changed tokenizer is worked out again"
+
+
+def test_unknown_words_do_not_pull_the_vector_away(model_path):
+    m = StaticModel(model_path)
+    with_unknown, plain = m.encode(["passport zzz qqq www", "passport"])
+    assert np.allclose(with_unknown, plain, atol=1e-6)

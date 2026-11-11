@@ -34,7 +34,12 @@ from .embed import data_home
 from .files import MAX_FILE, discover
 from .text import HEADED, coverage_terms, index_terms, join_pairs, passages, query_terms, read_text, terms
 
-SCHEMA = 2  # 2: terms folded and split as FTS5 stores them
+SCHEMA = 3  # 2: terms folded and split as FTS5 stores them; 3: FTS5 keeps no second copy of the terms
+# SQLite 3.43 (2023) can delete rows from a contentless FTS5 table: then the index keeps only its
+# inverted lists, not a copy of every passage's terms (142 MB of 337 for 77,000 passages). Older SQLite
+# gets the table with its copy.
+CONTENTLESS = sqlite3.sqlite_version_info >= (3, 43, 0)
+FTS_OPTIONS = ", content='', contentless_delete=1" if CONTENTLESS else ""
 CANDIDATES = 300  # from each ranking, before fusing
 # A passage found only by meaning is kept when it is at least this close to the best one: a ranking by
 # similarity always has a "best", so without a floor every search would fill its list with noise.
@@ -156,13 +161,20 @@ class Index:
             # An index from another version is a cache: it is built again, not an error.
             self.db.executescript("DROP TABLE IF EXISTS fts_vocab; DROP TABLE IF EXISTS fts; DROP TABLE IF EXISTS passages; "
                                   "DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS meta;")
-        self.db.executescript("""
+            old = None
+        if not old:
+            # Space freed by deleted files goes back to the disk (incremental_vacuum after an update);
+            # the setting takes effect on an empty database, or with the VACUUM that follows.
+            self.db.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            self.db.execute("VACUUM")
+        self.db.executescript(f"""
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, size INTEGER, mtime_ns INTEGER);
             CREATE TABLE IF NOT EXISTS passages (id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                 line INTEGER, page INTEGER, text TEXT, context TEXT, vec BLOB);
             CREATE INDEX IF NOT EXISTS passages_file ON passages(file_id);
-            CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(body, path, tokenize='unicode61 remove_diacritics 0');
+            CREATE INDEX IF NOT EXISTS passages_novec ON passages(id) WHERE vec IS NULL;
+            CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(body, path, tokenize='unicode61 remove_diacritics 0'{FTS_OPTIONS});
             CREATE VIRTUAL TABLE IF NOT EXISTS fts_vocab USING fts5vocab(fts, 'row');
         """)
         if self.meta("schema") is None:
@@ -195,17 +207,18 @@ class Index:
             self.set_meta("dim", str(model.dim))
         known = {p: (i, s, m) for i, p, s, m in self.db.execute("SELECT id, path, size, mtime_ns FROM files")}
         seen: set[str] = set()
+        base = str(self.root).rstrip("\\/") + os.sep
         for path in discover(self.root):
+            full = str(path)
             try:
-                info = path.stat()
+                info = os.stat(full)
             except OSError:
                 continue
-            rel = path.relative_to(self.root).as_posix() if path != self.root else path.name
+            # (string slicing, not pathlib: relative_to took 0.6 s for 6,000 files on every search)
+            rel = full[len(base):].replace(os.sep, "/") if full.startswith(base) else path.name
             if info.st_size > MAX_FILE:
                 continue
-            if rel in seen:
-                continue  # git lists a file in a merge conflict once per side
-            seen.add(rel)
+            seen.add(rel)  # (files.discover lists each file once, a merge conflict's included)
             st.files += 1
             old = known.get(rel)
             if old and old[1] == info.st_size and old[2] == info.st_mtime_ns:
@@ -227,12 +240,15 @@ class Index:
                 st.skipped += 1
                 continue
             path_terms = " ".join(index_terms(rel.replace("/", " ")))
-            for p in passages(text, headings=path.suffix.lower() in HEADED):
-                c = self.db.execute("INSERT INTO passages(file_id, line, page, text, context) VALUES (?, ?, ?, ?, ?)",
-                                    (cur.lastrowid, p.line, p.page, p.text, p.context))
-                self.db.execute("INSERT INTO fts(rowid, body, path) VALUES (?, ?, ?)",
-                                (c.lastrowid, " ".join(index_terms(p.context + "\n" + p.text)), path_terms))
-                st.passages += 1
+            # All of a file's passages in two statements, with their ids given here (one INSERT per passage
+            # took 9 of 65 s for 77,000 passages).
+            ps = passages(text, headings=path.suffix.lower() in HEADED)
+            first = (self.db.execute("SELECT COALESCE(MAX(id), 0) FROM passages").fetchone()[0] or 0) + 1
+            self.db.executemany("INSERT INTO passages(id, file_id, line, page, text, context) VALUES (?, ?, ?, ?, ?, ?)",
+                                [(first + i, cur.lastrowid, p.line, p.page, p.text, p.context) for i, p in enumerate(ps)])
+            self.db.executemany("INSERT INTO fts(rowid, body, path) VALUES (?, ?, ?)",
+                                [(first + i, " ".join(index_terms(p.context + "\n" + p.text)), path_terms) for i, p in enumerate(ps)])
+            st.passages += len(ps)
             if st.read % COMMIT_EVERY == 0:
                 self.db.commit()
                 if progress:
@@ -242,8 +258,12 @@ class Index:
                 self._remove(fid, rel)
                 st.removed += 1
         self.db.commit()
+        if st.removed or st.read:
+            self.db.execute("PRAGMA incremental_vacuum")  # give back the pages of what was removed or replaced
         if model is not None:
             st.embedded = self._embed_missing(model, progress)
+        if st.read or st.removed or st.embedded:
+            self.set_meta("vectors_version", str(int(self.meta("vectors_version") or 0) + 1))
         self.db.commit()
         self._vectors = None
         st.seconds = time.perf_counter() - t0
@@ -273,17 +293,40 @@ class Index:
 
     def counts(self) -> dict[str, int]:
         files = self.db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-        n, with_vec = self.db.execute("SELECT COUNT(*), COUNT(vec) FROM passages").fetchone()
-        return {"files": files, "passages": n, "embedded": with_vec}
+        n = self.db.execute("SELECT COUNT(*) FROM passages").fetchone()[0]
+        missing = self.db.execute("SELECT COUNT(*) FROM passages WHERE vec IS NULL").fetchone()[0]  # (a partial index)
+        return {"files": files, "passages": n, "embedded": n - missing}
 
     def _load_vectors(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self._vectors is None:
-            rows = self.db.execute("SELECT id, file_id, vec FROM passages WHERE vec IS NOT NULL").fetchall()
-            dim = int(self.meta("dim") or 0)
-            ids = np.fromiter((r[0] for r in rows), dtype=np.int64, count=len(rows))
-            files = np.fromiter((r[1] for r in rows), dtype=np.int64, count=len(rows))
-            mat = np.frombuffer(b"".join(r[2] for r in rows), dtype=np.float16).reshape(len(rows), dim) if rows else np.zeros((0, dim), np.float16)
-            self._vectors = (ids, files, mat)
+        """All vectors as one matrix, with each one's passage and file. Kept in a .npy file next to the
+        index and memory-mapped, rewritten only when the vectors change: rebuilding the matrix from the
+        rows took 0.4 s per search at 77,000 passages."""
+        if self._vectors is not None:
+            return self._vectors
+        version = self.meta("vectors_version") or "0"
+        cache = self.path.with_name(self.path.stem + ".vectors.npy")
+        keys = self.path.with_name(self.path.stem + ".vectors-ids.npy")
+        stamp = self.path.with_name(self.path.stem + ".vectors-version")
+        try:
+            if stamp.read_text(encoding="ascii") == version:
+                ids_files = np.load(keys)
+                self._vectors = (ids_files[0], ids_files[1], np.load(cache, mmap_mode="r"))
+                return self._vectors
+        except (OSError, ValueError):
+            pass
+        rows = self.db.execute("SELECT id, file_id, vec FROM passages WHERE vec IS NOT NULL").fetchall()
+        dim = int(self.meta("dim") or 0)
+        ids = np.fromiter((r[0] for r in rows), dtype=np.int64, count=len(rows))
+        files = np.fromiter((r[1] for r in rows), dtype=np.int64, count=len(rows))
+        mat = np.frombuffer(b"".join(r[2] for r in rows), dtype=np.float16).reshape(len(rows), dim) if rows else np.zeros((0, dim), np.float16)
+        self._vectors = (ids, files, mat)
+        with contextlib.suppress(OSError):  # a cache: if it cannot be written, the next search builds it again
+            stamp.unlink(missing_ok=True)
+            np.save(cache, mat)
+            np.save(keys, np.vstack([ids, files]))
+            _private(cache)
+            _private(keys)
+            stamp.write_text(version, encoding="ascii")
         return self._vectors
 
     def _allowed_files(self, glob: str | None) -> set[int] | None:
@@ -294,7 +337,8 @@ class Index:
         return {fid for fid, path in self.db.execute("SELECT id, path FROM files")
                 if fnmatch.fnmatch(path, glob) or fnmatch.fnmatch(path.rsplit("/", 1)[-1], glob)}
 
-    def keyword(self, query: str, limit: int = CANDIDATES, files: set[int] | None = None) -> list[int]:
+    def keyword(self, query: str, limit: int | None = None, files: set[int] | None = None) -> list[int]:
+        limit = limit or CANDIDATES  # (read now, not when the function was defined)
         q = query_terms(query)
         if not q or files == set():
             return []
@@ -328,8 +372,11 @@ class Index:
         out = {}
         for start in range(0, len(pids), 500):
             part = pids[start:start + 500]
-            for pid, body, path in self.db.execute(f"SELECT rowid, body, path FROM fts WHERE rowid IN ({','.join('?' * len(part))})", part):
-                have = set(body.split()) | set(path.split())
+            # The passage's terms, worked out again from its text (FTS5 keeps no copy of them).
+            for pid, text, context, path in self.db.execute(
+                    f"SELECT p.id, p.text, p.context, f.path FROM passages p JOIN files f ON f.id = p.file_id "
+                    f"WHERE p.id IN ({','.join('?' * len(part))})", part):
+                have = set(index_terms((context or "") + "\n" + text)) | set(index_terms(path.replace("/", " ")))
                 out[pid] = sum(w for t, w in weight.items() if t in have) / total
         return out
 
@@ -345,7 +392,8 @@ class Index:
         sims = mat[[r for _, r in rows]].astype(np.float32) @ vector.astype(np.float32)
         return {p: float(s) for (p, _), s in zip(rows, sims, strict=True)}
 
-    def semantic(self, vector: np.ndarray, limit: int = CANDIDATES, files: set[int] | None = None) -> list[tuple[int, float]]:
+    def semantic(self, vector: np.ndarray, limit: int | None = None, files: set[int] | None = None) -> list[tuple[int, float]]:
+        limit = limit or CANDIDATES
         ids, file_ids, mat = self._load_vectors()
         if not len(ids):
             return []

@@ -53,13 +53,20 @@ def _progress_bar(file: str, done: int, total: int) -> None:
         print(f"  {file}: {tenth * 10}% of {total / 1048576:.0f} MB", file=sys.stderr, flush=True)
 
 
-def get_model(name: str, *, ask: bool):
+def _n(count: int, word: str) -> str:
+    return f"{count:,} {word}{'' if count == 1 else 's'}"
+
+
+def get_model(name: str, *, ask: bool, needed: bool = False):
     """The model, or None when it is a built-in one not downloaded yet and the user did not agree to
     download it now (searching then matches keywords only)."""
     if name in MODELS and not is_downloaded(name):
         info = MODELS[name]
         if not ask or not _interactive():
-            _err(f"searching by keywords only: the model {name} is not downloaded. `sfind models download` fetches it "
+            if needed:
+                raise EmbedError(f"searching by meaning needs the model {name}, which is not downloaded yet: "
+                                 f"`sfind models download` fetches it ({info.size_mb} MB, once)")
+            _err(f"keywords only: the model {name} is not downloaded. `sfind models download` fetches it "
                  f"({info.size_mb} MB, once), then search by meaning works offline.")
             return None
         answer = input(f"sfind: to search by meaning, the model {name} ({info.languages}, {info.size_mb} MB) is downloaded once "
@@ -184,7 +191,7 @@ def cmd_search(args) -> int:
         first = _open(args.paths[0])
         name = _model_name(args, first)
         first.close()
-        model = get_model(name, ask=True)
+        model = get_model(name, ask=True, needed=args.mode == "meaning")
         if model is None and args.mode == "meaning":
             return 2
     indexes = [_open(path) for path in args.paths]
@@ -268,7 +275,7 @@ def cmd_index(args) -> int:
             model = None if args.keyword_only else get_model(name, ask=True)
             _update(idx, model, name, quiet=False)
             c = idx.counts()
-            _err(f"{idx.root}: {c['files']} files, {c['passages']} passages, {c['embedded']} with vectors")
+            _err(f"{idx.root}: {_n(c['files'], 'file')}, {_n(c['passages'], 'passage')}, {c['embedded']:,} with vectors")
         finally:
             idx.close()
     return 0
@@ -285,7 +292,7 @@ def cmd_status(args) -> int:
         try:
             c = idx.counts()
             size = db.stat().st_size / 1048576
-            print(f"{p}\n  {c['files']} files, {c['passages']} passages, {c['embedded']} with vectors ({idx.meta('model') or 'no model'})\n"
+            print(f"{p}\n  {_n(c['files'], 'file')}, {_n(c['passages'], 'passage')}, {c['embedded']:,} with vectors ({idx.meta('model') or 'no model'})\n"
                   f"  index: {db} ({size:.1f} MB)")
         finally:
             idx.close()
@@ -296,7 +303,9 @@ def cmd_forget(args) -> int:
     for path in args.paths:
         p = Path(path).expanduser().resolve()
         db = index_path(p)
-        gone = [f for f in (db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")) if f.exists()]
+        companions = [db.with_name(db.name + suffix) for suffix in ("-wal", "-shm", ".lock")]
+        companions += [db.with_name(db.stem + suffix) for suffix in (".vectors.npy", ".vectors-ids.npy", ".vectors-version")]
+        gone = [f for f in (db, *companions) if f.exists()]
         for f in gone:
             f.unlink()
         print(f"{p}: index deleted" if gone else f"{p}: there was no index")

@@ -145,6 +145,9 @@ class StaticModel:
         self.unk, self.median_token_length = self._facts()
         self.tokenizer.no_padding()
         self.tokenizer.enable_truncation(self.max_length)
+        # Without the character offsets of each token, which are not needed here: tokenizing 77,000
+        # passages took 26.8 s with them (tokenizers 0.20 and later have it).
+        self._encode_batch = getattr(self.tokenizer, "encode_batch_fast", self.tokenizer.encode_batch)
 
     def _facts(self) -> tuple[int | None, int]:
         """The unknown token's id and the median token length. Working them out takes half a second for
@@ -179,7 +182,7 @@ class StaticModel:
         cut = self.max_length * self.median_token_length  # characters: no point tokenizing what is cut anyway
         for start in range(0, len(texts), batch):
             chunk = [t[:cut] for t in texts[start:start + batch]]
-            for i, enc in enumerate(self.tokenizer.encode_batch(chunk, add_special_tokens=False)):
+            for i, enc in enumerate(self._encode_batch(chunk, add_special_tokens=False)):
                 ids = [t for t in enc.ids if t != self.unk]
                 if not ids:
                     continue

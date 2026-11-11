@@ -50,13 +50,15 @@ Neither "passport" nor "backoff" was in the query or the file: the match is by m
   `pip install "semantic-find[pdf]"`). Files in older encodings (GB18030, Big5, Shift-JIS, EUC-KR,
   Windows-1252) are recognized and read. A damaged file is skipped, never the folder.
 - **Small and fast.** The model is a static embedding model ([Model2Vec](https://github.com/MinishLab/model2vec)):
-  no neural network runs, so there is no PyTorch and no GPU. The only dependencies are numpy and
-  Hugging Face's `tokenizers`.
+  no neural network runs, so there is no PyTorch and no GPU. sfind itself needs numpy and Hugging
+  Face's `tokenizers`; `tokenizers` brings `huggingface_hub` and its own dependencies, about 20 small
+  packages in all.
 - **Says how sure it is.** Weak matches after a strong one are left out. In a folder of 500 passages
   or more, when nothing matches strongly (a search for something that is not in the folder, say),
   sfind says so and shows the three closest passages as such, exiting with 1 ("nothing found") for
   scripts; a small folder has too little for a match to stand out from, so there the closest passages
-  are simply listed. A passage with every word of the query is always shown. Copies of the same text
+  are simply listed. In a very large folder (tens of thousands of passages) the best of many vaguely
+  similar passages can stand out by chance, so a search for something absent may still show a few. A passage with every word of the query is always shown. Copies of the same text
   are shown once ("the same text in 24 other files").
 - **Grep-like.** `-g "*.md"` for some files only, `-l` for file names only (of the best `-k`, 10 by
   default, and their copies), `--json` for scripts, exit code 1 when nothing is found and 2 on an error.
@@ -177,8 +179,9 @@ small. Take these numbers as a sanity check, not a benchmark.
 
 0.1, in development. Tested with synthetic notes and a tiny hand-made model (no download in the
 tests), by hand on the Python standard library (728 files and 12,254 passages indexed in 5 s on a
-laptop) and on a generated folder of 3,060 mixed files (`eval/make_corpus.py`; indexed in 2.5 s once
-the files are in the disk cache). On Windows, files written moments before are slow to read the first
+laptop), on a generated folder of 3,060 mixed files (`eval/make_corpus.py`; indexed in 2.5 s once
+the files are in the disk cache) and on one of 6,060 longer files: 76,915 passages indexed in 49 s
+into a 195 MB index, searched in about 2 s (start-up included). On Windows, files written moments before are slow to read the first
 time while the antivirus scans them: 35 s for those 3,060 files. A search takes about 2 s with the multilingual model, 1 s of which is loading its 18 MB
 tokenizer, and under a second with the English ones.
 
