@@ -13,6 +13,8 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
+          activate-environment: true  # since v6 the .venv is not created and activated by default
       - run: uv pip install -e ".[pdf]" pytest ruff
+      - run: uv run --no-project sfind --version
       - run: uv run --no-project pytest -q
       - run: uv run --no-project ruff check src tests
