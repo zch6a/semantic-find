@@ -7,10 +7,10 @@ from semantic_find.text import STOP, decode, passages, query_terms, read_text, t
 
 def test_terms_split_identifiers_and_pair_cjk_characters():
     assert terms("parseHttpRequest") == ["parsehttprequest", "parse", "http", "request"]
-    assert terms("max_retry_count") == ["max_retry_count", "max", "retry", "count"]
+    assert terms("max_retry_count") == ["max", "retry", "count"], "as FTS5 stores them: it splits at _"
     assert terms("数据库连接") == ["数据", "据库", "库连", "连接"]
     assert terms("用 Python 写") == ["用", "python", "写"]
-    assert terms("Café don't") == ["café", "don't", "don", "t"]
+    assert terms("Café don't") == ["cafe", "don", "t"], "accents folded: cafe finds café"
 
 
 def test_query_terms_drop_filler_unless_that_is_all_there_is():

@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import __version__
 from .embed import DEFAULT_MODEL, MODELS, EmbedError, download, is_downloaded, load, model_dir
-from .index import Busy, Hit, Index, index_path
+from .index import SCORE_FLOOR, Busy, Hit, Index, index_path
 
 COMMANDS = {"index", "status", "forget", "models", "search"}
 
@@ -171,6 +171,13 @@ def cmd_search(args) -> int:
     if not query:
         _err("what should be searched for?")
         return 2
+    if args.top < 1:
+        _err("-k must be at least 1")
+        return 2
+    if len(query) > MAX_QUERY:
+        _err(f"the query is {len(query):,} characters long; only the first {MAX_QUERY:,} are used")
+        query = query[:MAX_QUERY]
+    args.paths = _distinct_roots(args.paths)
     if args.mode == "keyword":
         model = name = None
     else:
@@ -180,22 +187,33 @@ def cmd_search(args) -> int:
         model = get_model(name, ask=True)
         if model is None and args.mode == "meaning":
             return 2
+    indexes = [_open(path) for path in args.paths]
     results: list[tuple[Path, Hit]] = []
-    for path in args.paths:
-        idx = _open(path)
-        try:
+    try:
+        for idx in indexes:
             if not args.no_update:
                 _update(idx, model, name, args.quiet)
             elif model is not None and idx.meta("model") and idx.meta("model") != name:
                 raise RuntimeError(f"the index of {idx.root} was built with {idx.meta('model')}, not {name}: "
                                    f"search without --no-update to embed it again, or pass --model {idx.meta('model')}")
-            for hit in idx.search(query, model, k=args.top, mode=args.mode if model is not None else "keyword", glob=args.glob,
-                                  per_file=not args.all):
+        mode = args.mode if model is not None else "keyword"
+        vector = best = None
+        if model is not None and mode != "keyword":
+            vector = model.encode([query])[0]
+            if len(indexes) > 1:  # one scale for all: each folder scored against the best match in any of them
+                best = max((i.best_similarity(vector) for i in indexes if i.counts()["embedded"]), default=None)
+        for idx in indexes:
+            for hit in idx.search(query, model, k=args.top, mode=mode, glob=args.glob, per_file=not args.all,
+                                  query_vector=vector, best=best):
                 results.append((idx.root, hit))
-        finally:
+    finally:
+        for idx in indexes:
             idx.close()
     if any(not h.weak for _, h in results):  # strong results from one folder: the weak ones from another go
         results = [(r, h) for r, h in results if not h.weak]
+    if len(indexes) > 1 and results and mode != "keyword":
+        top = max(h.score for _, h in results)
+        results = [(r, h) for r, h in results if h.score >= SCORE_FLOOR * top or h.full]
     results.sort(key=lambda r: r[1].score, reverse=True)
     results = results[:args.top]
     found = bool(results) and not all(h.weak for _, h in results)
@@ -225,6 +243,21 @@ def cmd_search(args) -> int:
         if detail:
             print(f"    \033[2m({detail})\033[0m" if color else f"    ({detail})")
     return 0 if found else 1
+
+
+MAX_QUERY = 2000  # characters: a query is a question, not a document
+
+
+def _distinct_roots(paths: list[str]) -> list[str]:
+    """The folders to search, each once: the same folder given twice, or a folder inside another one
+    also given, would list every result twice."""
+    resolved = []
+    for p in paths:
+        r = Path(p).expanduser().resolve()
+        if r not in [x for x, _ in resolved]:
+            resolved.append((r, p))
+    keep = [(r, p) for r, p in resolved if not any(o != r and o.is_dir() and r.is_relative_to(o) for o, _ in resolved)]
+    return [p for _, p in keep]
 
 
 def cmd_index(args) -> int:

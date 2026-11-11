@@ -188,3 +188,39 @@ QUERIES.extend([
     ("手冲咖啡比例", "cooking/coffee.md", "cross"),
     ("电费怎么省", "money/electricity.md", "cross"),
 ])
+
+
+# Held out: written after KEYWORD_WEIGHT, SCORE_FLOOR and MIN_STANDOUT were chosen, and never used to
+# choose anything, so that the numbers they give are not flattered by tuning. Kinds are as above.
+HELDOUT = [
+    ("what do I need to fix a radiator that stays cold", "home/boiler.md", "meaning"),
+    ("which bin for glass bottles", "home/recycling.txt", "meaning"),
+    ("how long does dough need to sit", "cooking/bread.md", "meaning"),
+    ("rinse grains before cooking", "cooking/rice.md", "meaning"),
+    ("deadline for filing income tax", "money/tax-deadline.md", "meaning"),
+    ("monthly spending plan", "money/budget.md", "meaning"),
+    ("trouble sleeping on weekends", "health/sleep.md", "meaning"),
+    ("desk posture and stretching", "health/back-pain.md", "meaning"),
+    ("decisions from the planning session", "work/meeting-notes.md", "meaning"),
+    ("new employee first week", "work/onboarding.md", "meaning"),
+    ("cache that forgets the oldest entries", "code/cache.py", "meaning"),
+    ("validate an e-mail", "code/email_check.py", "meaning"),
+    ("router light stays red", "home/router.md", "words"),
+    ("emergency travel document", "travel/lost-passport.md", "words"),
+    ("LRUCache", "code/cache.py", "words"),
+    ("wifi password sticker", "home/router.md", "meaning"),
+    ("连接池空闲连接多久回收", "笔记/数据库连接池.md", "meaning"),
+    ("全量备份保留几天", "笔记/数据库备份.md", "meaning"),
+    ("合同里押金怎么写", "笔记/租房.md", "meaning"),
+    ("糖色怎么炒", "笔记/做饭.md", "meaning"),
+    ("冬天开车要换什么", "笔记/轮胎.txt", "meaning"),
+    ("报销要交哪些单据", "笔记/报销.md", "meaning"),
+    ("背单词的方法", "笔记/学英语.md", "meaning"),
+    ("装修刷墙几遍", "笔记/装修.md", "meaning"),
+    ("how to recover from jet lag", "travel/jet-lag.md", "words"),
+    ("what to bring when renewing a passport in China", "笔记/护照换发.md", "cross"),
+    ("tenant deposit refund", "笔记/租房.md", "cross"),
+    ("咖啡豆研磨", "cooking/coffee.md", "cross"),
+    ("退休金", "money/pension.md", "cross"),
+    ("登录密码加盐", "code/hashing.py", "cross"),
+]

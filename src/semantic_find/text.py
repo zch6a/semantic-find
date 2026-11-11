@@ -13,6 +13,7 @@ import html.parser
 import io
 import json
 import re
+import unicodedata
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,14 +25,30 @@ _JOINERS = re.compile(r"[_'’]")
 _CJK_RUN = re.compile(rf"^[{CJK}]+$")
 
 
+def fold(word: str) -> str:
+    """Lower case without accents ("Café" -> "cafe"), so that either spelling finds the other."""
+    if word.isascii():
+        return word.lower()
+    return "".join(c for c in unicodedata.normalize("NFKD", word.lower()) if not unicodedata.combining(c))
+
+
 @functools.lru_cache(maxsize=200_000)
 def _word_terms(tok: str) -> tuple[str, ...]:
-    """The terms of one word. Words repeat all the time (in code above all), so each is worked out
-    once: this made indexing about twice as fast."""
+    """The terms of one word, each made only of letters and digits, as SQLite's FTS5 stores them (it
+    splits at "_" and apostrophes): "parseHttpRequest" -> parsehttprequest, parse, http, request;
+    "max_retry_count" -> max, retry, count; "Café" -> cafe. Words repeat all the time (in code above
+    all), so each is worked out once: this made indexing about twice as fast."""
     if _CJK_RUN.match(tok):
         return tuple(tok[i:i + 2] for i in range(len(tok) - 1)) if len(tok) > 1 else (tok,)
-    parts = [p.lower() for piece in _JOINERS.split(tok) for p in _CAMEL.findall(piece)]
-    return (tok.lower(), *parts) if len(parts) > 1 else (tok.lower(),)
+    pieces = [p for p in _JOINERS.split(tok) if p]
+    out: list[str] = []
+    for piece in pieces:
+        whole = fold(piece)
+        parts = [fold(p) for p in _CAMEL.findall(piece)]
+        out.append(whole)
+        if len(parts) > 1:
+            out.extend(parts)
+    return tuple(dict.fromkeys(out))
 
 
 def index_terms(text: str) -> list[str]:
@@ -55,6 +72,23 @@ def terms(text: str) -> list[str]:
 STOP = set(["a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can", "could", "did", "do", "does", "doing", "for", "from", "had", "has", "have", "how", "i", "if", "in", "into", "is", "it", "its", "me", "my", "no", "not", "of", "on", "or", "our", "should", "so", "than", "that", "the", "their", "them", "then", "there", "these", "they", "this", "to", "was", "we", "were", "what", "when", "where", "which", "who", "whom", "why", "will", "with", "would", "you", "your", "yours", "about", "after", "again", "all", "also", "am", "any", "because", "before", "being", "both", "each", "few", "further", "here", "just", "more", "most", "other", "over", "own", "same", "some", "such", "too", "under", "until", "up", "very", "via", "vs", "off", "out", "only", "once", "while"]) | {
     "怎么", "什么", "如何", "为什", "么样", "哪里", "哪个", "一个", "我的", "我们", "你们", "他们", "可以", "应该", "需要", "是否",
     "有没", "这个", "那个", "这些", "那些", "怎样", "的", "了", "是", "在", "和", "与", "或", "吗", "呢", "吧", "啊"}
+
+
+# Chinese characters that carry no subject on their own, left out when a query's coverage is counted.
+STOP_CHARS = set("的了是在和与或吗呢吧啊么怎什何哪个这那们我你他她它")
+
+
+def coverage_terms(query: str) -> list[str]:
+    """The units in which "how much of the query does a passage contain" is counted: the query's words,
+    and for CJK text its characters (each is indexed too), because a character pair can span two words
+    ("么配" in "怎么配置") and is then in no passage at all."""
+    out: list[str] = []
+    for t in query_terms(query):
+        if _CJK_RUN.match(t):
+            out.extend(c for c in t if c not in STOP_CHARS)
+        else:
+            out.append(t)
+    return list(dict.fromkeys(out))
 
 
 def query_terms(query: str) -> list[str]:

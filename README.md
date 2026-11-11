@@ -52,10 +52,12 @@ Neither "passport" nor "backoff" was in the query or the file: the match is by m
 - **Small and fast.** The model is a static embedding model ([Model2Vec](https://github.com/MinishLab/model2vec)):
   no neural network runs, so there is no PyTorch and no GPU. The only dependencies are numpy and
   Hugging Face's `tokenizers`.
-- **Says how sure it is.** Weak matches after a strong one are left out. When nothing matches
-  strongly (a search for something that is not in the folder, say), sfind says so and shows the three
-  closest passages as such, exiting with 1 ("nothing found") for scripts. Copies of the same text are
-  shown once ("the same text in 24 other files").
+- **Says how sure it is.** Weak matches after a strong one are left out. In a folder of 500 passages
+  or more, when nothing matches strongly (a search for something that is not in the folder, say),
+  sfind says so and shows the three closest passages as such, exiting with 1 ("nothing found") for
+  scripts; a small folder has too little for a match to stand out from, so there the closest passages
+  are simply listed. A passage with every word of the query is always shown. Copies of the same text
+  are shown once ("the same text in 24 other files").
 - **Grep-like.** `-g "*.md"` for some files only, `-l` for file names only (of the best `-k`, 10 by
   default, and their copies), `--json` for scripts, exit code 1 when nothing is found and 2 on an error.
 
@@ -127,7 +129,11 @@ is.
 4. **Meaning**: each passage, with its file name and heading, becomes a vector: the average of its
    tokens' vectors in the static model, stored as float16.
 5. **Search**: each candidate scores its similarity to the query (relative to the best one) plus 0.15
-   times the share of the query's words it contains, rarer words weighing more. Reciprocal-rank
+   times the share of the query's words it contains, rarer words weighing more and a word that is in
+   no passage at all weighing most (so "xylophone lessons" is not covered by "lessons"). When several
+   folders are searched together, all are scored against the best match in any of them. This is a
+   convex combination of normalized scores, which Bruch, Gai and Ingber found better than rank fusion
+   ("An Analysis of Fusion Functions for Hybrid Retrieval", ACM TOIS 2023). Reciprocal-rank
    fusion, the usual way to combine two rankings, was tried first and measured worse: it let a passage
    sharing one word of four outrank the one that meant what was asked.
 6. **What is shown**: a passage found only by meaning must be at least half as close as the best one.
@@ -143,25 +149,29 @@ is.
 ## How well it finds things
 
 Measured with `eval/evaluate.py` on `eval/data.py`: 53 synthetic notes, documents and code files in
-English and Chinese, some of them near-misses for others, and 100 queries with a known answer. 18
-use the answer's own words, 52 say it in other words (sharing no content word with it), and 30 are
-in the other language. "Top 1" is how often the right file comes first.
+English and Chinese, some of them near-misses for others, and 130 queries with a known answer. The
+evaluation sorts the queries itself, from the index: **exact** queries use the answer's own words,
+**some words** queries share at least one word with it (its file name included), **no words** queries
+share none, and **other language** queries are in the other language. A result that sfind would call
+weak counts as a miss. "Top 1" is how often the right file comes first.
 
-| Default model | exact words, top 1 | other words, top 1 | other language, top 1 | all, top 1 | all, top 5 |
-|---|---|---|---|---|---|
-| keyword (`--mode keyword`) | 100% | 44% | 0% | 41% | 45% |
-| meaning (`--mode meaning`) | 89% | 71% | 70% | 74% | 91% |
-| **hybrid** (the default) | **100%** | **73%** | 67% | **76%** | **91%** |
-| hybrid, the documents among 3,000 other files (`--haystack 3000`) | 100% | 67% | 43% | 66% | 77% |
+| Hybrid (the default), default model | exact | some words | no words | other language | all, top 1 | all, top 5 |
+|---|---|---|---|---|---|---|
+| 100 queries the settings were chosen on | 100% | 93% | 54% | 70% | 78% | 91% |
+| 30 held-out queries, never used to choose anything | 75% | 100% | (1 query) | 40% | 87% | 93% |
+| the 100, with the documents among 3,000 other files | 100% | 71% | 50% | 40% | 62% | 68% |
 
-The last row is closer to a real folder: the same documents hidden among 3,000 generated notes,
-Office files, PDFs and code on similar subjects. With the English-only `potion-base-8M`, hybrid search
-finds 52% first, and nothing across languages, as expected.
+Keyword search alone gets the exact queries and 82% of the "some words" ones, and nothing else; search
+by meaning alone gets 74% of the 100 first. With the English-only `potion-base-8M`, hybrid search finds
+50% of the 100 first, and nothing across languages, as expected. The third row is closer to a real
+folder: the same documents hidden among 3,000 generated notes, Office files, PDFs and code on similar
+subjects.
 
 What this means in use: exact names and words are found as with grep; a question in other words
-finds the right file first about three times in four in a small folder, and two in three in a large
-one; across languages it often works but is the weak point of a static model. The set is small, so
-take it as a sanity check, not a benchmark.
+finds the right file first about half the time and among the first five most of the time; across
+languages it is the weak point of a static model. The held-out queries turned out to share more words
+with their answers than meant (20 of 30), so they are an easier test, not a fairer one; the set is
+small. Take these numbers as a sanity check, not a benchmark.
 
 ## Status
 

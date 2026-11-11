@@ -124,3 +124,57 @@ Real use. `eval/make_corpus.py` (new) writes a large, messy synthetic folder: 3,
 | among 3,000 other files | 64% | 75% | 67% | 37% |
 
 66 tests (new: `tests/test_results.py` for copies, the score floor, the stand-out test, singular and plural, and the corpus maker), ruff clean.
+
+## Round 3
+
+Checked against the literature, tested at scale, and reviewed a second time by an independent reviewer who reproduced each finding.
+
+**Literature**
+- Bruch, Gai and Ingber ("An Analysis of Fusion Functions for Hybrid Retrieval", ACM TOIS 2023) find that a convex combination of normalized scores beats reciprocal-rank fusion, and that its one weight is tuned with few examples. sfind arrived at the same thing in rounds 1 and 2, independently, on its own evaluation set; the README now cites the paper.
+- Qdrant's distribution-based score fusion normalizes each result list by mean ± 3σ, close to sfind's stand-out test.
+- Work on relevance filtering argues for per-query calibration rather than a global cosine cutoff, which the stand-out test is a form of.
+- Keyword search for CJK by character pairs is what Lucene's CJK analyzer does; sfind adds single characters.
+
+**The stand-out test at scale changed a decision from round 2.** `eval/standout.py` (new) embeds 1,000 to 64,000 generated passages in memory, with the eval documents among them. For the right answers to 82 queries it measured the z-score (deviations above the mean similarity), and the same for the best match to 20 subjects absent from the folder:
+
+| passages | right answer, median z | weakest tenth | absent subject, mean of best z | √(2 ln n) |
+|---|---|---|---|---|
+| 1,053 | 3.81 | 1.74 | 3.55 | 3.73 |
+| 64,053 | 3.75 | 1.67 | 3.89 | 4.70 |
+
+The noise grows with the folder, as extreme-value theory predicts, and overlaps the answers. Four statistics were compared: global z, z against ranks 20–300, the gap to the next 20, and raw similarity. Set to keep 90% of the right answers, the best of them (raw similarity) caught 20–30% of the absent subjects, and the others caught none. Round 2's rule ("drop what does not stand out") was hiding right answers to remove noise. **Weak matches are now labelled instead:**
+- when there are strong results, the weak ones are not shown;
+- when there are none, sfind says "no strong match", lists the three closest, and exits 1;
+- `-l` prints nothing, and `--json` marks them `weak`.
+
+Among 3,000 files, top 1 went from 64% to 66% and top 5 from 75% to 77% (counting what is shown).
+
+**The second review: 12 confirmed findings and 2 suspected. All are fixed, with tests in `tests/test_review2.py`.** Two of the tests were checked by undoing their fix and watching them fail.
+- **The only file containing the exact query word could be hidden** by the score floor, when another passage matched by meaning ("backoff"). A passage with every word of the query is now never dropped, which keeps the README's grep promise.
+- **Scores from several folders were not comparable**: each folder divided by its own best match. All are now scored against the best match in any of them, the score floor is applied once to the merged list, and weak results from one folder go when another has strong ones.
+- **"xylophone lessons" matched a note with "lessons"**: words that occur nowhere were left out of coverage. They now weigh the most, and coverage for Chinese is counted by characters, which are indexed too (so a pair spanning two words, "么配", no longer distorts it). A keyword hit sharing under half the query must also stand out, like a match by meaning.
+- **Accented and underscored words had no weight**, because FTS5 folds and splits them while sfind's terms did not. Terms are now made exactly as FTS5 stores them: accents folded, "cafe" finds "café", and identifiers split at `_` and apostrophes. This is schema 2; an old index is rebuilt automatically instead of being an error.
+- **`-g` added results**: the stand-out statistics were computed on the filtered subset. They now come from the whole folder.
+- **The same folder twice, or a folder and its subfolder,** listed every result twice. Overlapping roots are merged.
+- **Passages without vectors** (`index --keyword-only`, or while another sfind embeds) scored at most 0.15 and were cut. Their keyword coverage now stands in for their meaning.
+- **A file name that is not valid Unicode** aborted the whole search. It is now skipped.
+- **Copies credited the wrong file**: another passage of a copy file was counted as the original's "more". The copy file keeps its own other passages.
+- **`-k 0` and `-k -1`** silently found nothing; a 40,000-word query took 6 s; `--mode meaning --no-update` without vectors said "nothing found". Now `-k` is checked, queries are cut at 2,000 characters with a note, and the vector case is explained.
+- **The evaluation was not honest**, which matters most:
+  - 28 of the 52 "other words" queries share an indexed word with their answer, counting file names. `evaluate.py` now sorts queries itself, from the index, into exact, some words, no words and other language.
+  - Weak results were counted as hits although the CLI says "nothing found"; they are now misses.
+  - `standout.py` had a "bcrypt" subject listed as absent that was present.
+  - The haystack's 50 copied notes answered two backup queries.
+  - The settings were tuned on the same queries they are reported on. 30 held-out queries, written after the settings were fixed, are now reported apart. They ended up easier than meant (20 of 30 share words with their answer), and the README says so.
+
+**Honest numbers now** (hybrid, default model):
+
+| | exact | some words | no words | other language | top 1 | top 5 |
+|---|---|---|---|---|---|---|
+| 100 tuning queries | 100% | 93% | 54% | 70% | 78% | 91% |
+| 30 held out | 75% | 100% | (1) | 40% | 87% | 93% |
+| the 100 among 3,000 files | 100% | 71% | 50% | 40% | 62% | 68% |
+
+A known trade-off from the coverage fix: an absent word weighs the most even when it is a common verb. "how to recover from jet lag" now ranks the jet-lag note 6th, because "recover" occurs nowhere and the note matches "jet lag" only through its file name. Without word frequencies from outside the folder, that case cannot be told from "xylophone lessons".
+
+77 tests, ruff clean.

@@ -32,9 +32,9 @@ import numpy as np
 
 from .embed import data_home
 from .files import MAX_FILE, discover
-from .text import HEADED, index_terms, join_pairs, passages, query_terms, read_text, terms
+from .text import HEADED, coverage_terms, index_terms, join_pairs, passages, query_terms, read_text, terms
 
-SCHEMA = 1
+SCHEMA = 2  # 2: terms folded and split as FTS5 stores them
 CANDIDATES = 300  # from each ranking, before fusing
 # A passage found only by meaning is kept when it is at least this close to the best one: a ranking by
 # similarity always has a "best", so without a floor every search would fill its list with noise.
@@ -51,6 +51,7 @@ MIN_SIMILARITY = 0.1  # and never below this, however weak the best one is
 # folder has no background to stand out from.
 MIN_STANDOUT = 3.0
 STANDOUT_FROM = 500
+FULL_COVERAGE = 0.99  # a passage with (nearly) every word of the query is kept whatever its score
 WEAK_SHOWN = 3  # when nothing is strong: how many of the closest are shown
 # How much a passage containing all of the query's words gains over one that only means the same.
 # Chosen on eval/ (100 queries, three models, 0 to 1.5 tried): higher loses queries across languages,
@@ -128,6 +129,7 @@ class Hit:
     context: str = ""  # the heading the passage is under
     same: list[str] = field(default_factory=list)  # other files with exactly the same passage
     weak: bool = False  # found by meaning alone, without standing out: shown only when nothing is strong
+    full: bool = False  # contains every word of the query: never left out
 
 
 class Index:
@@ -149,20 +151,23 @@ class Index:
         self.db.close()
 
     def _create(self) -> None:
+        old = self.db.execute("SELECT name FROM sqlite_master WHERE name='meta'").fetchone()
+        if old and (self.meta("schema") or "0") != str(SCHEMA):
+            # An index from another version is a cache: it is built again, not an error.
+            self.db.executescript("DROP TABLE IF EXISTS fts_vocab; DROP TABLE IF EXISTS fts; DROP TABLE IF EXISTS passages; "
+                                  "DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS meta;")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, size INTEGER, mtime_ns INTEGER);
             CREATE TABLE IF NOT EXISTS passages (id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                 line INTEGER, page INTEGER, text TEXT, context TEXT, vec BLOB);
             CREATE INDEX IF NOT EXISTS passages_file ON passages(file_id);
-            CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(body, path, tokenize='unicode61 remove_diacritics 2');
+            CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(body, path, tokenize='unicode61 remove_diacritics 0');
             CREATE VIRTUAL TABLE IF NOT EXISTS fts_vocab USING fts5vocab(fts, 'row');
         """)
         if self.meta("schema") is None:
             self.set_meta("schema", str(SCHEMA))
             self.set_meta("root", str(self.root))
-        elif int(self.meta("schema")) != SCHEMA:
-            raise RuntimeError(f"the index {self.path} is from another version of semantic-find; delete it with `sfind forget`")
         self.db.commit()
 
     def meta(self, key: str) -> str | None:
@@ -205,6 +210,11 @@ class Index:
             old = known.get(rel)
             if old and old[1] == info.st_size and old[2] == info.st_mtime_ns:
                 continue
+            try:
+                rel.encode("utf-8")
+            except UnicodeEncodeError:  # a file name that is not valid Unicode (bytes from another system)
+                st.skipped += 1
+                continue
             if old:
                 self._remove(old[0], rel)
             try:
@@ -216,7 +226,7 @@ class Index:
             if not text:
                 st.skipped += 1
                 continue
-            path_terms = " ".join(terms(rel.replace("/", " ")))
+            path_terms = " ".join(index_terms(rel.replace("/", " ")))
             for p in passages(text, headings=path.suffix.lower() in HEADED):
                 c = self.db.execute("INSERT INTO passages(file_id, line, page, text, context) VALUES (?, ?, ?, ?, ?)",
                                     (cur.lastrowid, p.line, p.page, p.text, p.context))
@@ -304,13 +314,14 @@ class Index:
         """For each passage, the share of the query's words it contains, each word weighted by its
         rarity (IDF). Words that occur nowhere in the index (such as a character pair that spans two
         Chinese words, "么配" in "怎么配置") are left out of the count."""
-        q = query_terms(query)
+        q = coverage_terms(query)
         if not q or not pids:
             return {}
         marks = ",".join("?" * len(q))
         df = dict(self.db.execute(f"SELECT term, doc FROM fts_vocab WHERE term IN ({marks})", q).fetchall())
         n = self.db.execute("SELECT COUNT(*) FROM fts").fetchone()[0] or 1
-        weight = {t: math.log(1 + n / df[t]) for t in q if df.get(t)}
+        # A word in no passage at all weighs the most: "xylophone lessons" is not covered by "lessons".
+        weight = {t: math.log(1 + n / df.get(t, 0.5)) for t in q}
         total = sum(weight.values())
         if not total:
             return {}
@@ -336,47 +347,68 @@ class Index:
 
     def semantic(self, vector: np.ndarray, limit: int = CANDIDATES, files: set[int] | None = None) -> list[tuple[int, float]]:
         ids, file_ids, mat = self._load_vectors()
-        if files is not None:
-            keep = np.isin(file_ids, np.fromiter(files, dtype=np.int64, count=len(files)))
-            ids, mat = ids[keep], mat[keep]
         if not len(ids):
             return []
         if vector.shape[0] != mat.shape[1]:
             raise RuntimeError(f"the index was built with {self.meta('model')}, whose vectors do not fit this model's; "
                                "search without --no-update to embed it again, or pass --model " + str(self.meta("model")))
         sims = mat.astype(np.float32) @ vector.astype(np.float32)
-        top = np.argsort(-sims)[:limit]
-        self.last_spread = (float(sims.mean()), float(sims.std()))  # for the stand-out test in search
+        # The background for the stand-out test is the whole folder, whatever -g lets through.
+        self.last_spread = (float(sims.mean()), float(sims.std()))
         self.last_count = len(sims)
+        if files is not None:
+            keep = np.isin(file_ids, np.fromiter(files, dtype=np.int64, count=len(files)))
+            ids, sims = ids[keep], sims[keep]
+        top = np.argsort(-sims)[:limit]
         return [(int(ids[i]), float(sims[i])) for i in top]
 
+    def best_similarity(self, vector: np.ndarray) -> float:
+        """The highest similarity of any passage to the query: searches of several folders are scored
+        against the best of all of them, so that their scores can be compared."""
+        _, _, mat = self._load_vectors()
+        return float((mat.astype(np.float32) @ vector.astype(np.float32)).max()) if len(mat) else 0.0
+
     def search(self, query: str, model=None, *, k: int = 10, mode: str = "hybrid", glob: str | None = None,
-               per_file: bool = True) -> list[Hit]:
+               per_file: bool = True, query_vector: np.ndarray | None = None, best: float | None = None) -> list[Hit]:
         """The best `k` passages for `query` (by default the best one per file). `mode`: "hybrid" (both
         rankings fused), "keyword" or "meaning". A model is needed for meaning; without vectors in the
-        index, hybrid is keyword search."""
+        index, hybrid is keyword search. `best`: the similarity to score against (the best over several
+        folders searched together; by default this folder's best)."""
         allowed = self._allowed_files(glob)
         kw = self.keyword(query, files=allowed) if mode in ("hybrid", "keyword") else []
         sem: list[tuple[int, float]] = []
-        query_vector = None
-        if mode in ("hybrid", "meaning") and model is not None and self.counts()["embedded"]:
-            query_vector = model.encode([query])[0]
-            sem = self.semantic(query_vector, files=allowed)
         if mode == "meaning" and model is None:
             raise RuntimeError("searching by meaning needs a model")
+        if mode in ("hybrid", "meaning") and model is not None:
+            if not self.counts()["embedded"]:
+                if mode == "meaning":
+                    raise RuntimeError(f"the index of {self.root} has no vectors yet: search once without --no-update to embed it")
+            else:
+                if query_vector is None:
+                    query_vector = model.encode([query])[0]
+                sem = self.semantic(query_vector, files=allowed)
         score: dict[int, float] = {}
         weak: set[int] = set()
         similarity = dict(sem)
         floor = max(MIN_SIMILARITY, sem[0][1] * RELATIVE_FLOOR) if sem else MIN_SIMILARITY
+        cover: dict[int, float] = {}
+        full: set[int] = set()
         if sem:
-            best = max(sem[0][1], 1e-9)
+            best = max(best if best is not None else sem[0][1], 1e-9)
             cover = self.coverage(query, kw)
+            full = {pid for pid in kw if cover.get(pid, 0.0) >= FULL_COVERAGE}
             if kw:
                 similarity.update(self.similarities(query_vector, [p for p in kw if p not in similarity]))
-            for rank, pid in enumerate(kw):  # BM25's order breaks ties between passages that cover as much
-                score[pid] = KEYWORD_WEIGHT * cover.get(pid, 0.0) * (1 - rank / (10 * len(kw))) + max(similarity.get(pid, 0.0), 0.0) / best
             mean, spread = self.last_spread
             standout = mean + MIN_STANDOUT * max(spread, 1e-6) if self.last_count >= STANDOUT_FROM else -1.0
+            for rank, pid in enumerate(kw):  # BM25's order breaks ties between passages that cover as much
+                c = cover.get(pid, 0.0)
+                # A passage without a vector yet (indexed by keywords only, or while another sfind embeds
+                # it) is judged by its words alone: the share of the query it contains stands for its meaning.
+                meaning = max(similarity[pid], 0.0) / best if pid in similarity else c
+                score[pid] = KEYWORD_WEIGHT * c * (1 - rank / (10 * len(kw))) + meaning
+                if c < 0.5 and pid in similarity and similarity[pid] < standout:
+                    weak.add(pid)  # one word of several in common, and nothing in its meaning stands out
             for pid, sim in sem:
                 if pid not in score and sim >= floor:
                     score[pid] = sim / best
@@ -385,7 +417,8 @@ class Index:
             if any(pid not in weak for pid in score):
                 score = {pid: s for pid, s in score.items() if pid not in weak}
             top = max(score.values(), default=0.0)
-            score = {pid: s for pid, s in score.items() if s >= SCORE_FLOOR * top}
+            # ... but a passage with every word of the query is never left out: it is what grep would find
+            score = {pid: s for pid, s in score.items() if s >= SCORE_FLOOR * top or pid in full}
         else:  # keywords alone: BM25's order
             for rank, pid in enumerate(kw):
                 score[pid] = 1.0 / (rank + 1)
@@ -416,10 +449,10 @@ class Index:
             if same_text in by_text:  # a copy of a passage already listed: said once, with where the copies are
                 if path not in by_text[same_text].same and path != by_text[same_text].path:
                     by_text[same_text].same.append(path)
-                by_file.setdefault(path, by_text[same_text])
-                continue
+                continue  # (the copy's file may still have other passages of its own to show)
             found = join_pairs(query, [t for t in dict.fromkeys(terms(text)) if t in q_terms])
-            hit = Hit(path, line, page, text, score[pid], found, similarity.get(pid), context=context or "", weak=pid in weak)
+            hit = Hit(path, line, page, text, score[pid], found, similarity.get(pid), context=context or "", weak=pid in weak,
+                      full=pid in full)
             hits.append(hit)
             by_file[path] = hit
             by_text[same_text] = hit

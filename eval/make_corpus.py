@@ -117,7 +117,7 @@ def main() -> int:
     # near-duplicates and exact duplicates
     for i in range(50):
         src = root / "notes" / f"copy-{i}.md"
-        src.write_text("# Copied note\n\nThe backup runs every night at two. Check the logs on Monday.\n" + ("(edited)" if i % 2 else ""), encoding="utf-8")
+        src.write_text("# Copied note\n\nThe cat flap needs a new magnet; the hardware shop on the corner has them.\n" + ("(edited)" if i % 2 else ""), encoding="utf-8")
     # what should be skipped, damaged or empty
     (root / "node_modules" / "pkg").mkdir(parents=True, exist_ok=True)
     (root / "node_modules" / "pkg" / "README.md").write_text("insurance claim water damage pipe", encoding="utf-8")

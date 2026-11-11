@@ -22,7 +22,7 @@ from make_corpus import paragraph  # noqa: E402
 
 from semantic_find.embed import DEFAULT_MODEL, load  # noqa: E402
 
-ABSENT = ["xylophone lessons", "bcrypt password hashing cost", "volcano eruption warning", "chess opening theory", "satellite orbit decay",
+ABSENT = ["xylophone lessons", "sailing knots for beginners", "volcano eruption warning", "chess opening theory", "satellite orbit decay",
           "量子计算", "股票期权行权", "古筝考级", "火山喷发预警", "卫星轨道衰减"]
 
 
