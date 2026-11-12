@@ -1,5 +1,9 @@
 name: CI
 on: [push, pull_request]
+# Read-only: tests need no write access.
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -9,8 +13,10 @@ jobs:
         python: ["3.10", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           python-version: ${{ matrix.python }}
           activate-environment: true  # since v6 the .venv is not created and activated by default
