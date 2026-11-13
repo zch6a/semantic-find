@@ -241,3 +241,9 @@ The release check: every claim and number in both READMEs measured again on the 
 - Status: 0.1.0; long lines that had been run together were rewrapped. CONTRIBUTING says about 85 tests. CHANGELOG is dated, and the release is tagged `v0.1.0`.
 
 84 tests, mutation runner 47 of 47, ruff clean. semantic-find has been polished five times.
+
+### 2026-11-14 — Chinese README: AI tone
+
+- 2 places changed in README.zh-CN.md: a "是实测的，不是估计的" correction nobody needed, now a plain statement; and a three-item 顿号 list (中文、日文、韩文) folded into 中日韩文字.
+- The checks follow the findings of lieflat-less-ai-tone (shiujan, CC BY-NC 4.0): its findings applied, its text not copied.
+- Left as they were: colon-led lists, numbered steps in How it works, the "这意味着"-style restatement, real contrasts (an easier test rather than a fairer one), and exact numbers.
